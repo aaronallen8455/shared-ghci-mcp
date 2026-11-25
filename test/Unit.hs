@@ -11,7 +11,7 @@ main =
   defaultMain $
     testGroup
       "unit"
-      [ promptTests
+      [ sentinelTests
       , stripAnsiTests
       , renderLineTests
       , cleanTests
@@ -19,29 +19,57 @@ main =
       , summarizeTests
       ]
 
-promptTests :: TestTree
-promptTests =
+sentinelTests :: TestTree
+sentinelTests =
   testGroup
-    "prompts"
-    [ testCase "finds a prompt with its position" $
-        prompts (BC.pack "ab[ghci#12]> ") @?= [Prompt 12 2 13]
-    , testCase "finds several prompts in order" $
-        map promptNumber (prompts (BC.pack "[ghci#1]> 1+1\r\n2\r\n[ghci#2]> ")) @?= [1, 2]
-    , testCase "ignores continuation prompts" $
-        map promptNumber (prompts (BC.pack "[ghci#3]| x\r\n[ghci#4]> ")) @?= [4]
-    , testCase "ignores incomplete or malformed prompts" $
-        prompts (BC.pack "[ghci#]> [ghci#5] [ghci#x]> [ghci#6") @?= []
-    , testCase "finds a prompt right after output with no newline" $
-        map promptNumber (prompts (BC.pack "no newline[ghci#3]> ")) @?= [3]
-    , testCase "finds a prompt after a false start" $
-        map promptNumber (prompts (BC.pack "[ghci#[ghci#7]> ")) @?= [7]
-    , testCase "typing promptSetup doesn't itself look like a prompt" $
-        prompts (BC.pack (concat promptSetup)) @?= []
-    , testCase "lastBanner finds the most recent GHCi banner" $
-        lastBanner (BC.pack "GHCi, version 9.4\r\n...\r\nGHCi, version 9.4\r\n") @?= Just 24
-    , testCase "lastBanner is Nothing before GHCi starts" $
-        lastBanner (BC.pack "Resolving dependencies...\r\nBuilding library...") @?= Nothing
+    "sentinels"
+    [ testCase "the typed sentinel never contains its own marker" $
+        findCompletion 7 0 (BC.pack (sentinelCommand 7 ++ "\r\n")) @?= Nothing
+    , testCase "finds a command's output and the prompt that follows" $
+        findCompletion 7 1 (logOf "ghci> " "double 21" "42\r\n" 7)
+          @?= Just (Completion ["42"] ["ghci>"])
+    , testCase "keeps output that has no trailing newline" $
+        cOutput <$> findCompletion 7 1 (logOf "ghci> " "putStr \"hi\"" "hi" 7) @?= Just ["hi"]
+    , testCase "is Nothing until the marker arrives" $
+        findCompletion 7 1 (BC.pack "double 21\r\n42\r\nghci> ") @?= Nothing
+    , testCase "ignores markers of other sentinels" $
+        findCompletion 8 1 (logOf "ghci> " "double 21" "42\r\n" 7) @?= Nothing
+    , testCase "removes a multi-line prompt" $
+        cOutput <$> findCompletion 7 1 (logOf "\r\nmulti\r\nprompt> " "double 21" "42\r\n" 7) @?= Just ["42"]
+    , testCase "removes a prompt whose number changes" $
+        cOutput <$> findCompletion 7 1 (BC.pack ("putStr \"hi\"\r\nhi15 Demo $ " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\n16 Demo $ "))
+          @?= Just ["hi"]
+    , testCase "copes with extra lines after the marker (:set +t)" $
+        cOutput <$> findCompletion 7 1 (BC.pack ("double 21\r\n42\r\nghci> " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\nit :: ()\r\nghci> "))
+          @?= Just ["42"]
+    , testCase "drops every echoed input line of multi-line input" $
+        cOutput <$> findCompletion 7 4 (logOf "ghci> " ":{\r\nghci| f x =\r\nghci|   x\r\nghci| :}" "" 7) @?= Just []
+    , testCase "hides leftovers of an interrupted command" $
+        cOutput
+          <$> findCompletion 7 1
+            ( BC.pack
+                ( "length [1..]\r\n^CInterrupted.\r\nghci> " ++ sentinelCommand 6 ++ "\r\n<<shared-ghci:6>>\r\n"
+                    ++ "ghci> " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\nghci> "
+                )
+            )
+          @?= Just ["^CInterrupted."]
+    , testCase "partialOutput drops input echo and sentinel lines" $
+        partialOutput 1 (BC.pack ("length [1..]\r\n" ++ sentinelCommand 7 ++ "\r\nworking\r\n")) @?= ["working", ""]
+    , testCase "isSentinelLine recognises echoes and markers only" $
+        map isSentinelLine ["ghci> " ++ sentinelCommand 3, "<<shared-ghci:3>>", "42", "<<other>>"]
+          @?= [True, True, False, False]
+    , testCase "trailingLine is the prompt plus unsent input" $
+        trailingLine (BC.pack "42\r\n\ESC[1mghci> \ESC[0mmap (+1") @?= "ghci> map (+1"
     ]
+  where
+    -- What the log holds after typing @input@ and a sentinel at an idle GHCi
+    -- (whose prompt was printed before the log offset): the echoed input,
+    -- the output, the prompt with the echoed sentinel, the marker, the prompt.
+    logOf prompt input output n =
+      BC.pack
+        ( input ++ "\r\n" ++ output ++ prompt ++ sentinelCommand n ++ "\r\n"
+            ++ "<<shared-ghci:" ++ show (n :: Integer) ++ ">>\r\n" ++ prompt
+        )
 
 stripAnsiTests :: TestTree
 stripAnsiTests =
@@ -82,7 +110,7 @@ cleanTests =
   testGroup
     "clean"
     [ testCase "splits lines and drops CR before LF" $
-        clean (BC.pack "[ghci#1]> 1+1\r\r\n2\r\n") @?= ["[ghci#1]> 1+1", "2", ""]
+        clean (BC.pack "ghci> 1+1\r\r\n2\r\n") @?= ["ghci> 1+1", "2", ""]
     , testCase "removes colours inside lines" $
         clean (BC.pack "\ESC[31mError\ESC[0m\r\n") @?= ["Error", ""]
     , testCase "decodes UTF-8" $

@@ -96,13 +96,13 @@ tests =
   , test "won't send while the human has typed input at the prompt" $ \env -> do
       envTmux env ["send-keys", "-t", envTarget env, "-l", "map (+1"]
       threadDelay 500000
-      failsWith env "ghci_eval" ["command" .= ("1+1" :: String)] "typed unsent input at the prompt: \"map (+1\""
+      failsWith env "ghci_eval" ["command" .= ("1+1" :: String)] "typed unsent input at the GHCi prompt: \"map (+1\""
       envTmux env ["send-keys", "-t", envTarget env, "C-u"]
       threadDelay 500000
       (@?= "2") =<< eval env "1+1"
   , test "reports status" $ \env -> do
       out <- ok env "ghci_status" ["lines" .= (5 :: Int)]
-      assertContains "state:   idle, ready for commands" out
+      assertContains "state:   idle at the prompt" out
   , test "detects that GHCi exited, and restarts it" $ \env -> do
       failsWith env "ghci_eval" ["command" .= (":quit" :: String)] "GHCi has exited"
       assertContains "GHCi is ready" =<< ok env "ghci_restart" ["timeout_seconds" .= (120 :: Int)]
@@ -117,23 +117,23 @@ tests =
       failsWith env "ghci_eval" [] "invalid arguments"
       failsWith env "ghci_eval" ["command" .= (42 :: Int)] "expected String"
       failsWith env "no_such_tool" [] "unknown tool: no_such_tool"
-  , test "runs a wrapper script, typing the prompt setup into GHCi" $ \_ ->
+  , test "runs GHCi through a wrapper script" $ \_ ->
       withProject ["./repl.sh"] writeWrapper $ \dir -> do
-        st <- readState dir
-        lookup "init" st @?= Just "typed"
         withServer dir $ \env -> do
           assertContains "GHCi is ready" =<< ok env "ghci_wait" ["timeout_seconds" .= (120 :: Int)]
           (@?= "42") =<< eval env "double 21"
           -- the setup must be typed again after a restart
           assertContains "GHCi is ready" =<< ok env "ghci_restart" ["timeout_seconds" .= (120 :: Int)]
           (@?= "8") =<< eval env "double 4"
-  , test "repairs the prompt when a later startup script overrides it" $ \_ ->
-      withProject
-        ["ghci", "Demo.hs", "-ghci-script={ghci_script}", "-ghci-script=override.ghci"]
-        (\dir -> writeFile (dir </> "override.ghci") dotGhci)
-        $ \dir -> withServer dir $ \env -> do
-          assertContains "GHCi is ready" =<< ok env "ghci_wait" ["timeout_seconds" .= (60 :: Int)]
-          (@?= "42") =<< eval env "double 21"
+  , test "keeps working when the prompt changes" $ \env -> do
+      (@?= "(no output)") =<< eval env ":set prompt \"changed> \""
+      (@?= "42") =<< eval env "double 21"
+      (@?= "(no output)") =<< eval env ":set prompt \"\\nmulti\\nline> \""
+      (@?= "42") =<< eval env "double 21"
+      (@?= "no newline") =<< eval env "putStr \"no newline\""
+      (@?= "(no output)") =<< eval env ":set prompt-function \\mods n -> return (show n ++ unwords mods ++ \" $ \")"
+      (@?= "8") =<< eval env "double 4"
+      (@?= "(no output)") =<< eval env ":set prompt \"my-prompt> \""
   , test "explains when there is no session" $ \_ -> do
       tmp <- getCanonicalTemporaryDirectory
       bracket (createTempDirectory tmp "no-session") removeDirectoryRecursive $ \dir ->
@@ -145,8 +145,8 @@ tests =
   where
     test name body = \getEnv -> testCase name (getEnv >>= body)
 
--- | Stands in for a wrapper such as one that runs GHCi in docker: a command
--- ghci-session can't pass -ghci-script to, with output before GHCi starts.
+-- | Stands in for a wrapper such as one that runs GHCi in docker, with some
+-- output and a delay before GHCi starts.
 writeWrapper :: FilePath -> IO ()
 writeWrapper dir = do
   let f = dir </> "repl.sh"

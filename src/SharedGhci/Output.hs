@@ -1,11 +1,22 @@
--- | Pure helpers: finding GHCi's prompts in raw terminal output, turning that
+-- | Pure helpers: marking the end of a command's output, turning raw terminal
 -- output into plain text, preparing input to send, and shortening long output.
+--
+-- After each command the server types a /sentinel/ line,
+--
+-- > System.IO.putStrLn "<<shared-ghci:\&17>>"
+--
+-- which GHCi runs once the command has finished, printing the /marker/
+-- @<<shared-ghci:17>>@. The @\\&@ (an empty escape) means the echoed input
+-- never looks like the marker, and nothing depends on what GHCi's prompt is.
 module SharedGhci.Output
-  ( -- * Prompts
-    Prompt (..)
-  , prompts
-  , promptSetup
-  , lastBanner
+  ( -- * Sentinels
+    sentinelCommand
+  , sentinelMarker
+  , isSentinelLine
+  , Completion (..)
+  , findCompletion
+  , partialOutput
+  , trailingLine
     -- * Cleaning terminal output
   , decodeLenient
   , clean
@@ -29,65 +40,125 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit, isSpace)
 import Data.Foldable (toList)
-import Data.List (dropWhileEnd, intercalate)
+import Data.List (dropWhileEnd, intercalate, isInfixOf, isPrefixOf, isSuffixOf)
+import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Sequence as Seq
 import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8With)
 import Data.Text.Encoding.Error (lenientDecode)
 
 ------------------------------------------------------------------------------
--- Prompts
+-- Sentinels
 
--- | A @[ghci#N]> @ prompt found in the log.
-data Prompt = Prompt
-  { promptNumber :: !Int
-  , promptStart :: !Int -- ^ byte index of the @[@
-  , promptEnd :: !Int -- ^ byte index just after the trailing space
+sentinelTag :: String
+sentinelTag = "<<shared-ghci:"
+
+-- | What the typed sentinel line looks like up to its number, as echoed.
+sentinelEchoPrefix :: String
+sentinelEchoPrefix = "System.IO.putStrLn \"" ++ sentinelTag ++ "\\&"
+
+-- | The line to type after a command.
+sentinelCommand :: Integer -> String
+sentinelCommand n = sentinelEchoPrefix ++ show n ++ ">>\""
+
+-- | What GHCi prints when it runs @sentinelCommand n@.
+sentinelMarker :: Integer -> BS.ByteString
+sentinelMarker n = BC.pack (sentinelTag ++ show n ++ ">>")
+
+-- | Is this cleaned line an echo of any sentinel, or any sentinel's output?
+-- (Used to hide them; markers of earlier, interrupted commands can show up.)
+isSentinelLine :: String -> Bool
+isSentinelLine l = sentinelEchoPrefix `isInfixOf` l || isMarker (trim l)
+  where
+    isMarker s = sentinelTag `isPrefixOf` s && ">>" `isSuffixOf` s
+
+-- | A finished command.
+data Completion = Completion
+  { cOutput :: [String]
+  -- ^ the command's output, without the echoed input, sentinel or prompt
+  , cPrompt :: [String]
+  -- ^ lines GHCi printed after the marker: its next prompt (possibly
+  -- incomplete if read too soon), and any lines such as @it :: ()@ before it
   }
   deriving (Eq, Show)
 
--- | Every main prompt @[ghci#N]> @ in the data, in order. Continuation
--- prompts (@[ghci#N]| @) and incomplete prompts are ignored.
-prompts :: BS.ByteString -> [Prompt]
-prompts = go 0
+-- | Look for sentinel @n@'s marker in the bytes logged since a command was
+-- sent. @echoed@ is how many input lines were typed before the sentinel;
+-- GHCi echoes each on its own line, and they are dropped.
+findCompletion :: Integer -> Int -> BS.ByteString -> Maybe Completion
+findCompletion n echoed dat
+  | BS.null rest = Nothing
+  | otherwise = Just (Completion (removeEcho (drop echoed (clean pre))) promptLs)
   where
-    marker = BC.pack "[ghci#"
-    close = BC.pack "]> "
-    go off bs =
-      let (pre, rest) = BS.breakSubstring marker bs
-          i = off + BS.length pre
-          afterMarker = BS.drop (BS.length marker) rest
-          digits = BC.takeWhile isDigit afterMarker
-          afterDigits = BS.drop (BS.length digits) afterMarker
-       in if BS.null rest
-            then []
-            else
-              if not (BS.null digits) && close `BS.isPrefixOf` afterDigits
-                then
-                  let e = i + BS.length marker + BS.length digits + BS.length close
-                   in Prompt (read (BC.unpack digits)) i e : go e (BS.drop (e - off) bs)
-                else go (i + 1) (BS.drop (i + 1 - off) bs)
+    marker = sentinelMarker n
+    (pre, rest) = BS.breakSubstring marker dat
+    -- the first cleaned line is the remainder of the marker's own line
+    promptLs = drop 1 (clean (BS.drop (BS.length marker) rest))
 
--- | GHCi commands that install the numbered prompts 'prompts' looks for.
--- The same text is in the init.ghci that @ghci-session@ writes.
-promptSetup :: [String]
-promptSetup =
-  [ ":set prompt-function \\_ n -> return (\"[ghci#\" ++ show n ++ \"]> \")"
-  , ":set prompt-cont-function \\_ n -> return (\"[ghci#\" ++ show n ++ \"]| \")"
-  ]
+    -- @pre@ ends with GHCi's prompt followed by the echoed sentinel. Text
+    -- before the prompt on that line is output without a trailing newline.
+    removeEcho ls = case break (sentinelEchoPrefix `isInfixOf`) (reverse ls) of
+      (_, []) -> filter (not . isSentinelLine) ls
+      (_, echoLine : revBefore) ->
+        let before = filter (not . isSentinelLine) (reverse revBefore)
+            x0 = dropWhileEnd isSpace (takeBefore sentinelEchoPrefix echoLine)
+         in stripPrompt before x0 promptLs
 
--- | Byte index of the last @GHCi, version@ startup banner in the data. Once it
--- has been printed, GHCi owns the terminal and typed input reaches it.
-lastBanner :: BS.ByteString -> Maybe Int
-lastBanner = go Nothing 0
+-- | Remove the prompt that precedes the echoed sentinel. It is matched
+-- against the prompt GHCi printed after the marker, with each run of digits
+-- matching any run of digits (prompts often show a line number or the time).
+-- A prompt can span several lines; the longest tail of 'cPrompt' that
+-- matches is removed.
+stripPrompt :: [String] -> String -> [String] -> [String]
+stripPrompt before x0 promptLs =
+  fromMaybe plain (listToMaybe [r | k <- [length promptLs, length promptLs - 1 .. 1], Just r <- [tryK k]])
   where
-    banner = BC.pack "GHCi, version "
-    go found off bs =
-      let (pre, rest) = BS.breakSubstring banner bs
-          i = off + BS.length pre
-       in if BS.null rest
-            then found
-            else go (Just i) (i + 1) (BS.drop (BS.length pre + 1) bs)
+    plain = before ++ [x0 | not (null x0)]
+    tryK k =
+      let pk = map (dropWhileEnd isSpace) (lastN k promptLs)
+          (pInit, pLast) = (init pk, last pk)
+          m = length pInit
+       in case promptSuffixLength pLast x0 of
+            Just len
+              | length before >= m
+              , and (zipWith matchesWhole pInit (lastN m before)) ->
+                  let x = dropWhileEnd isSpace (take (length x0 - len) x0)
+                   in Just (take (length before - m) before ++ [x | not (null x)])
+            _ -> Nothing
+    matchesWhole p l = promptSuffixLength p l == Just (length l)
+
+-- | If @s@ ends with text matching prompt @p@, the length of that text. Each
+-- run of digits in @p@ matches any non-empty run of digits.
+promptSuffixLength :: String -> String -> Maybe Int
+promptSuffixLength p s = go (reverse p) (reverse s) 0
+  where
+    go [] _ n = Just n
+    go pr@(c : _) sr n
+      | isDigit c =
+          let (ds, sr') = span isDigit sr
+           in if null ds then Nothing else go (dropWhile isDigit pr) sr' (n + length ds)
+    go (c : pr) (d : sr) n | c == d = go pr sr (n + 1)
+    go _ _ _ = Nothing
+
+-- | Output so far of a command that hasn't finished, with input echo and
+-- sentinel lines removed.
+partialOutput :: Int -> BS.ByteString -> [String]
+partialOutput echoed = filter (not . isSentinelLine) . drop echoed . clean
+
+-- | The last (unterminated) line of terminal output: at an idle GHCi, its
+-- prompt plus anything typed but not yet entered.
+trailingLine :: BS.ByteString -> String
+trailingLine dat = case clean dat of
+  [] -> ""
+  ls -> last ls
+
+takeBefore :: String -> String -> String
+takeBefore needle = go []
+  where
+    go acc s@(c : r)
+      | needle `isPrefixOf` s = reverse acc
+      | otherwise = go (c : acc) r
+    go acc [] = reverse acc
 
 ------------------------------------------------------------------------------
 -- Cleaning terminal output

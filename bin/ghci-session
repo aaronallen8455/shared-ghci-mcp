@@ -19,9 +19,7 @@
 #   ghci-session start -- stack ghci
 #   ghci-session start -- ghci src/Main.hs
 #   ghci-session start -- ./repl.sh      (any wrapper, e.g. GHCi in docker)
-# For cabal/stack/ghci the prompt setup is passed with -ghci-script. Any other
-# command runs unchanged and the setup is typed into GHCi once it starts; to
-# pass the script yourself instead, put {ghci_script} where its path goes.
+# The command runs unchanged; GHCi's prompt and .ghci files don't matter.
 
 set -euo pipefail
 
@@ -67,7 +65,7 @@ session_name_for() {
 is_running() { t has-session -t "=$1" 2>/dev/null; }
 
 cmd_start() {
-  local dir="$PWD" state sess log init
+  local dir="$PWD" state sess log
   state="$dir/$STATE_DIRNAME"
   sess="$(session_name_for "$dir")"
   if is_running "$sess"; then
@@ -78,38 +76,10 @@ cmd_start() {
   mkdir -p "$state"
   printf '*\n' > "$state/.gitignore"
   log="$state/ghci.log"
-  init="$state/init.ghci"
-  # The numbered prompt is how the MCP server tells where a command's output
-  # ends: it waits for a prompt with a higher number than before.
-  cat > "$init" <<'EOF'
-:set prompt-function \_ n -> return ("[ghci#" ++ show n ++ "]> ")
-:set prompt-cont-function \_ n -> return ("[ghci#" ++ show n ++ "]| ")
-EOF
+  rm -f "$state/init.ghci"   # used by earlier versions
 
   local -a cmd
   if (( $# > 0 )); then cmd=("$@"); else cmd=(cabal repl); fi
-  # How the numbered prompt gets set up:
-  #   script: pass -ghci-script for commands we know (or where {ghci_script}
-  #           marks the spot), so GHCi sets it at startup.
-  #   typed:  for anything else (wrapper scripts, docker, ...), run the
-  #           command unchanged; the MCP server types the :set commands into
-  #           GHCi once its "GHCi, version" banner appears.
-  local init_mode=typed i
-  for i in "${!cmd[@]}"; do
-    if [[ "${cmd[$i]}" == *"{ghci_script}"* ]]; then
-      cmd[$i]="${cmd[$i]//\{ghci_script\}/$init}"; init_mode=script
-    fi
-  done
-  if [[ "$init_mode" == typed ]]; then
-    case "$(basename "${cmd[0]}")" in
-      cabal) cmd+=("--repl-options=-ghci-script=$init"); init_mode=script ;;
-      stack) cmd+=("--ghci-options=-ghci-script=$init"); init_mode=script ;;
-      ghci|ghc|ghci-*|ghc-*) cmd+=("-ghci-script=$init"); init_mode=script ;;
-    esac
-  fi
-  if [[ "$init_mode" == script && "$init" == *" "* ]]; then
-    die "project path contains spaces, which -ghci-script can't handle: $init"
-  fi
   local cmdstr
   cmdstr="$(printf '%q ' "${cmd[@]}")"
 
@@ -120,7 +90,6 @@ EOF
     echo "log=$log"
     echo "dir=$dir"
     echo "cmd=$cmdstr"
-    echo "init=$init_mode"
   } > "$state/state"
 
   : > "$log"
@@ -132,9 +101,6 @@ EOF
   t pipe-pane -o -t "=$sess:" "cat >> $(printf '%q' "$log")"
   t respawn-pane -k -t "=$sess:" -c "$dir" "$cmdstr"
   echo "Started GHCi session '$sess': $cmdstr"
-  if [[ "$init_mode" == typed ]]; then
-    echo "  (the agent's prompt setup will be typed into GHCi once it starts)"
-  fi
   echo "  attach: ghci-session attach    log: $log"
 }
 

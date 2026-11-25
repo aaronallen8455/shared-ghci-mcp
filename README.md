@@ -8,11 +8,13 @@ through an MCP server.
   `.shared-ghci/ghci.log`, and the agent reads its results from that log
   rather than from the screen. Scrollback limits and wrapped lines can't cut
   off an error message.
-- **Exact command boundaries.** GHCi's prompt is set to `[ghci#N]> `. A
-  command's output ends at the first prompt whose number is higher than the
-  one shown before the command was sent.
-- **No interleaving.** The agent won't send input while GHCi is busy or while
-  you have a partly typed line at the prompt.
+- **Exact command boundaries, whatever the prompt.** After each command the
+  server types an end-marker line, `System.IO.putStrLn
+  "<<shared-ghci:\&17>>"`. GHCi runs it once the command finishes, so the
+  printed `<<shared-ghci:17>>` marks the end of the command's output. Your
+  prompt, `.ghci` files and `:set prompt` don't matter.
+- **No clobbering.** The agent won't send a command while one of its own is
+  still running, or while you have a partly typed line at the prompt.
 
 ## Requirements
 
@@ -36,7 +38,7 @@ Sources:
 
 - `app/Main.hs`: the MCP server (JSON-RPC over stdio, using aeson)
 - `src/SharedGhci/Session.hs`: driving tmux and reading the log
-- `src/SharedGhci/Output.hs`: pure helpers (prompt detection, escape-code
+- `src/SharedGhci/Output.hs`: pure helpers (finding end markers, escape-code
   stripping, input preparation, shortening long output)
 
 The server finds the session by searching upward from Claude Code's working
@@ -64,30 +66,15 @@ scrollback. If GHCi exits, the pane stays open so you can read why.
 
 ### Wrapper scripts and Docker
 
-The agent needs GHCi's prompt set to `[ghci#N]> `. There are two ways this
-happens:
-
-- **`cabal`, `stack`, `ghci` and `ghc` commands:** the launcher adds
-  `-ghci-script=.shared-ghci/init.ghci` to the command, so GHCi sets the
-  prompt at startup.
-- **Any other command** (a wrapper script, `docker run ...`, `nix develop -c
-  ...`): the launcher runs it unchanged. When the server sees GHCi's
-  `GHCi, version ...` banner in the log, it types the two `:set
-  prompt-function` commands into GHCi, and does so again after every restart.
-  You'll see those two lines appear in the session.
-
-For a script that runs GHCi in Docker:
+The launcher runs whatever command you give it unchanged, so any wrapper
+works: a script, `docker run ...`, `nix develop -c ...`. For a script that runs
+GHCi in Docker:
 
 - Run the container with `-it`. tmux gives the script a real terminal, and
   GHCi needs one inside the container too.
-- Don't start GHCi with `-v0`, which hides the banner the server waits for.
 - Compiler errors show paths as the container sees them (e.g.
   `/app/src/Foo.hs`). If the project is mounted somewhere other than its host
   path, tell the agent how to map them, for example in `CLAUDE.md`.
-
-To pass the startup script yourself instead, put `{ghci_script}` in the
-command where its path should go, e.g.
-`ghci-session start -- ./repl.sh --ghci-options=-ghci-script={ghci_script}`.
 
 ## Agent tools
 
@@ -111,16 +98,20 @@ You may want to add this to a project's `CLAUDE.md`:
 
 ## Caveats
 
-- A `.ghci` or other startup script that sets its own prompt is fine. If one
-  runs after the prompt setup and overrides it, the server notices that GHCi
-  started but showed no `[ghci#N]> ` prompt for 3 seconds, and types the setup
-  again. If you change the prompt by hand later in a session, though, the
-  agent can no longer tell where output ends. `ghci_restart` fixes it.
+- You'll see the end-marker line and its output in the terminal after each
+  command the agent runs.
+- A command that reads from stdin (e.g. `getLine`) receives the end-marker
+  line as its input, and the agent's call then times out. `ghci_interrupt`
+  recovers.
+- The agent can only tell that you're mid-way through typing a line, not
+  that you're running something. If you are, its command waits in GHCi's
+  input until yours finishes.
+- The prompt is removed from the agent's output by matching it against the
+  prompt GHCi shows next. Runs of digits (line numbers, clocks) match any
+  digits, but a prompt that changes in other ways between consecutive prompts
+  can leave prompt text in the output.
 - Escape sequences are removed from the output the agent sees, including any
   that your program prints on purpose.
-- Project paths containing spaces don't work with `cabal`, `stack` or `ghci`
-  commands, because `-ghci-script` can't take a path with spaces. Wrapper
-  scripts aren't affected.
 
 ## Tests
 
@@ -134,7 +125,9 @@ directory using `bin/ghci-session`. It then runs the server and acts as an MCP
 client, covering:
 
 - evaluation and multi-line input
-- starting through a wrapper script, with the prompt setup typed into GHCi
+- a project `.ghci` with its own prompt, and changing the prompt mid-session
+  (to multi-line and line-numbered prompts)
+- starting through a wrapper script
 - a 300+ line reload error, returned in full
 - timeouts, `ghci_wait` and interrupts
 - shortening long output
