@@ -95,8 +95,16 @@ cmd_start() {
   : > "$log"
   # Create the pane with a placeholder process, start logging, and only then
   # launch GHCi, so no early output is missed.
-  t start-server \; set-option -g history-limit 100000 \; \
+  #
+  # status off + no alternate screen: tmux then scrolls the whole terminal it
+  # is attached to, so GHCi output lands in that terminal's own scrollback
+  # (e.g. a Neovim :terminal buffer) instead of being repainted in place.
+  # These apply only to this private tmux server, not your usual one.
+  t start-server \; set-option -g history-limit 100000 \; set-option -g status off \; \
     new-session -d -s "$sess" -x 250 -y 50 -c "$dir" "sleep 86400"
+  if ! t show-options -s terminal-overrides 2>/dev/null | grep -q 'smcup@'; then
+    t set-option -as terminal-overrides ',*:smcup@:rmcup@'
+  fi
   t set-option -w -t "=$sess:" remain-on-exit on
   t pipe-pane -o -t "=$sess:" "cat >> $(printf '%q' "$log")"
   t respawn-pane -k -t "=$sess:" -c "$dir" "$cmdstr"

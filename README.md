@@ -64,6 +64,31 @@ scrollback. If GHCi exits, the pane stays open so you can read why.
 
 `.shared-ghci/` contains a `.gitignore` that ignores the whole directory.
 
+### Viewing the session in Neovim (or any terminal)
+
+```vim
+:vsplit | terminal ghci-session attach
+```
+
+The session's tmux server has no status bar and doesn't use the terminal's
+alternate screen. tmux therefore scrolls the terminal it is attached to,
+rather than repainting it in place. GHCi's output ends up in that terminal's
+own scrollback: a Neovim `:terminal` buffer, iTerm, and so on. You can then
+scroll and search it with normal Neovim motions. Neovim keeps 10,000 lines of
+terminal scrollback by default; to keep more:
+
+```vim
+autocmd TermOpen * setlocal scrollback=100000
+```
+
+When tmux redraws the whole screen, for example after the window is resized,
+the visible lines can appear twice in the scrollback. tmux's own scrollback
+(`C-b [`) has everything too.
+
+These settings take effect when the session's tmux server starts. If a
+session from an older version is running, restart the server with
+`ghci-session stop` and `tmux -L shared-ghci kill-server`, then start again.
+
 ### Wrapper scripts and Docker
 
 The launcher runs whatever command you give it unchanged, so any wrapper
