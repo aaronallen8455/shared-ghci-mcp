@@ -61,15 +61,13 @@ handleRequest sess (Request (Just mid) method params) = Just <$> case method of
   "tools/list" -> pure (ok mid (object ["tools" .= tools]))
   "tools/call" -> do
     r <- try . try $ do
-      (name, args) <- either (throwIO . GhciError) pure . parseIn $
+      (name, args) <- either (throwIO . GhciError . T.pack) pure . parseIn $
         (,) <$> params .: "name" <*> params .:? "arguments" .!= mempty
-      t <- callTool sess name args
-      _ <- evaluate (length t)
-      pure t
+      evaluate =<< callTool sess name args
     let (txt, isErr) = case r of
           Right (Right t) -> (t, False)
           Right (Left (GhciError e)) -> (e, True)
-          Left (e :: SomeException) -> ("internal error: " ++ show e, True)
+          Left (e :: SomeException) -> ("internal error: " <> T.pack (show e), True)
     pure . ok mid $
       object
         [ "content" .= [object ["type" .= ("text" :: Text), "text" .= txt]]
@@ -95,7 +93,7 @@ errorResp mid code msg =
     , "error" .= object ["code" .= code, "message" .= msg]
     ]
 
-callTool :: Session -> Text -> Object -> IO String
+callTool :: Session -> Text -> Object -> IO Text
 callTool sess name args = case name of
   "ghci_eval" -> do
     cmd <- arg (args .: "command")
@@ -106,10 +104,10 @@ callTool sess name args = case name of
   "ghci_interrupt" -> interrupt sess
   "ghci_restart" -> restart sess =<< timeoutArg 300
   "ghci_status" -> status sess . max 1 =<< arg (args .:? "lines" .!= 40)
-  _ -> throwIO (GhciError ("unknown tool: " ++ T.unpack name))
+  _ -> throwIO (GhciError ("unknown tool: " <> name))
   where
     arg :: Parser a -> IO a
-    arg p = either (throwIO . GhciError . ("invalid arguments: " ++)) pure (parseIn p)
+    arg p = either (throwIO . GhciError . ("invalid arguments: " <>) . T.pack) pure (parseIn p)
     timeoutArg :: Double -> IO Double
     timeoutArg d = do
       t <- arg (args .:? "timeout_seconds" .!= d)

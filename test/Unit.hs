@@ -1,7 +1,11 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Main (main) where
 
-import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString as BS
+import Data.Text (Text)
+import qualified Data.Text as T
+import Data.Text.Encoding (encodeUtf8)
 import SharedGhci.Output
 import Test.Tasty
 import Test.Tasty.HUnit
@@ -24,51 +28,52 @@ sentinelTests =
   testGroup
     "sentinels"
     [ testCase "the typed sentinel never contains its own marker" $
-        findCompletion 7 0 (BC.pack (sentinelCommand 7 ++ "\r\n")) @?= Nothing
+        findCompletion 7 0 (enc (sentinelCommand 7 <> "\r\n")) @?= Nothing
     , testCase "finds a command's output and the prompt that follows" $
         findCompletion 7 1 (logOf "ghci> " "double 21" "42\r\n" 7)
           @?= Just (Completion ["42"] ["ghci>"])
     , testCase "keeps output that has no trailing newline" $
         cOutput <$> findCompletion 7 1 (logOf "ghci> " "putStr \"hi\"" "hi" 7) @?= Just ["hi"]
     , testCase "is Nothing until the marker arrives" $
-        findCompletion 7 1 (BC.pack "double 21\r\n42\r\nghci> ") @?= Nothing
+        findCompletion 7 1 (enc "double 21\r\n42\r\nghci> ") @?= Nothing
     , testCase "ignores markers of other sentinels" $
         findCompletion 8 1 (logOf "ghci> " "double 21" "42\r\n" 7) @?= Nothing
     , testCase "removes a multi-line prompt" $
         cOutput <$> findCompletion 7 1 (logOf "\r\nmulti\r\nprompt> " "double 21" "42\r\n" 7) @?= Just ["42"]
     , testCase "removes a prompt whose number changes" $
-        cOutput <$> findCompletion 7 1 (BC.pack ("putStr \"hi\"\r\nhi15 Demo $ " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\n16 Demo $ "))
+        cOutput <$> findCompletion 7 1 (enc ("putStr \"hi\"\r\nhi15 Demo $ " <> sentinelCommand 7 <> "\r\n<<shared-ghci:7>>\r\n16 Demo $ "))
           @?= Just ["hi"]
     , testCase "copes with extra lines after the marker (:set +t)" $
-        cOutput <$> findCompletion 7 1 (BC.pack ("double 21\r\n42\r\nghci> " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\nit :: ()\r\nghci> "))
+        cOutput <$> findCompletion 7 1 (enc ("double 21\r\n42\r\nghci> " <> sentinelCommand 7 <> "\r\n<<shared-ghci:7>>\r\nit :: ()\r\nghci> "))
           @?= Just ["42"]
     , testCase "drops every echoed input line of multi-line input" $
         cOutput <$> findCompletion 7 4 (logOf "ghci> " ":{\r\nghci| f x =\r\nghci|   x\r\nghci| :}" "" 7) @?= Just []
     , testCase "hides leftovers of an interrupted command" $
         cOutput
           <$> findCompletion 7 1
-            ( BC.pack
-                ( "length [1..]\r\n^CInterrupted.\r\nghci> " ++ sentinelCommand 6 ++ "\r\n<<shared-ghci:6>>\r\n"
-                    ++ "ghci> " ++ sentinelCommand 7 ++ "\r\n<<shared-ghci:7>>\r\nghci> "
+            ( enc
+                ( "length [1..]\r\n^CInterrupted.\r\nghci> " <> sentinelCommand 6 <> "\r\n<<shared-ghci:6>>\r\n"
+                    <> "ghci> " <> sentinelCommand 7 <> "\r\n<<shared-ghci:7>>\r\nghci> "
                 )
             )
           @?= Just ["^CInterrupted."]
     , testCase "partialOutput drops input echo and sentinel lines" $
-        partialOutput 1 (BC.pack ("length [1..]\r\n" ++ sentinelCommand 7 ++ "\r\nworking\r\n")) @?= ["working", ""]
+        partialOutput 1 (enc ("length [1..]\r\n" <> sentinelCommand 7 <> "\r\nworking\r\n")) @?= ["working", ""]
     , testCase "isSentinelLine recognises echoes and markers only" $
-        map isSentinelLine ["ghci> " ++ sentinelCommand 3, "<<shared-ghci:3>>", "42", "<<other>>"]
+        map isSentinelLine ["ghci> " <> sentinelCommand 3, "<<shared-ghci:3>>", "42", "<<other>>"]
           @?= [True, True, False, False]
     , testCase "trailingLine is the prompt plus unsent input" $
-        trailingLine (BC.pack "42\r\n\ESC[1mghci> \ESC[0mmap (+1") @?= "ghci> map (+1"
+        trailingLine (enc "42\r\n\ESC[1mghci> \ESC[0mmap (+1") @?= "ghci> map (+1"
     ]
   where
     -- What the log holds after typing @input@ and a sentinel at an idle GHCi
     -- (whose prompt was printed before the log offset): the echoed input,
     -- the output, the prompt with the echoed sentinel, the marker, the prompt.
+    logOf :: Text -> Text -> Text -> Integer -> BS.ByteString
     logOf prompt input output n =
-      BC.pack
-        ( input ++ "\r\n" ++ output ++ prompt ++ sentinelCommand n ++ "\r\n"
-            ++ "<<shared-ghci:" ++ show (n :: Integer) ++ ">>\r\n" ++ prompt
+      enc
+        ( input <> "\r\n" <> output <> prompt <> sentinelCommand n <> "\r\n"
+            <> "<<shared-ghci:" <> T.pack (show (n :: Integer)) <> ">>\r\n" <> prompt
         )
 
 stripAnsiTests :: TestTree
@@ -110,9 +115,9 @@ cleanTests =
   testGroup
     "clean"
     [ testCase "splits lines and drops CR before LF" $
-        clean (BC.pack "ghci> 1+1\r\r\n2\r\n") @?= ["ghci> 1+1", "2", ""]
+        clean (enc "ghci> 1+1\r\r\n2\r\n") @?= ["ghci> 1+1", "2", ""]
     , testCase "removes colours inside lines" $
-        clean (BC.pack "\ESC[31mError\ESC[0m\r\n") @?= ["Error", ""]
+        clean (enc "\ESC[31mError\ESC[0m\r\n") @?= ["Error", ""]
     , testCase "decodes UTF-8" $
         clean (BS.pack [0xE2, 0x80, 0xA2, 0x20, 0x78]) @?= ["\x2022 x"]
     , testCase "replaces invalid UTF-8 instead of failing" $
@@ -148,16 +153,20 @@ summarizeTests =
     , testCase "trimBlankLines drops blank lines at both ends only" $
         trimBlankLines ["", "", "a", "", "b", ""] @?= ["a", "", "b"]
     , testCase "output at the limit is not cut" $
-        length (lines (summarizeOutput "out.txt" (numbered maxLines))) @?= maxLines
+        length (T.lines (summarizeOutput "out.txt" (numbered maxLines))) @?= maxLines
     , testCase "long output keeps head and tail with a note" $ do
-        let out = lines (summarizeOutput "out.txt" (numbered 1000))
+        let out = T.lines (summarizeOutput "out.txt" (numbered 1000))
         length out @?= headLines + 3 + tailLines
         take 2 out @?= ["1", "2"]
         last out @?= "1000"
         out !! headLines @?= ""
         out !! (headLines + 1)
           @?= "... [640 lines omitted; full output (1000 lines) saved to out.txt] ..."
-        out !! (headLines + 3) @?= show (1000 - tailLines + 1)
+        out !! (headLines + 3) @?= T.pack (show (1000 - tailLines + 1))
     ]
   where
-    numbered n = map show [1 .. n :: Int]
+    numbered n = map (T.pack . show) [1 .. n :: Int]
+
+-- | Test logs are written as text and encoded the way a terminal would.
+enc :: Text -> BS.ByteString
+enc = encodeUtf8

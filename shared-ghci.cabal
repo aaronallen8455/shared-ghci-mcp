@@ -43,6 +43,7 @@ test-suite unit
                   , bytestring
                   , tasty
                   , tasty-hunit
+                  , text
 
 -- Starts a real GHCi with bin/ghci-session and drives it through the MCP
 -- server. Needs tmux and ghci; skipped (with a message) if tmux is missing.

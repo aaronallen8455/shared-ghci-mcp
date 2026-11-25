@@ -15,9 +15,11 @@ import Data.Aeson.Types (Pair, Parser, parseMaybe)
 import qualified Data.ByteString.Char8 as BC
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (sort)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import System.Directory
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode (..), exitSuccess)
@@ -65,38 +67,38 @@ tests =
       (@?= "(no output)") =<< eval env "triple :: Int -> Int\ntriple x =\n\tx * 3"
       (@?= "15") =<< eval env "triple 5"
   , test "reload returns a long error in full" $ \env -> do
-      writeFile (envDir env </> "Demo.hs") (demoSource ++ badDefinition)
+      TIO.writeFile (envDir env </> "Demo.hs") (demoSource <> badDefinition)
       out <- ok env "ghci_reload" []
       assertContains "Couldn't match" out
       assertContains "show 59" out -- the end of the long expression
-      assertBool ("expected a long error, got " ++ show (length (lines out)) ++ " lines")
-        (length (lines out) > 100)
-      assertBool "last line should report failure" ("Failed" `isPrefixOf` last (lines out))
-      writeFile (envDir env </> "Demo.hs") demoSource
+      assertBool ("expected a long error, got " ++ show (length (T.lines out)) ++ " lines")
+        (length (T.lines out) > 100)
+      assertBool "last line should report failure" ("Failed" `T.isPrefixOf` last (T.lines out))
+      TIO.writeFile (envDir env </> "Demo.hs") demoSource
       -- GHC says "loaded" or "reloaded" depending on the version
       assertContains "Ok, one module" =<< ok env "ghci_reload" []
   , test "a timed-out command can be waited for" $ \env -> do
-      out <- ok env "ghci_eval" ["command" .= ("Control.Concurrent.threadDelay 3000000 >> putStrLn \"done\"" :: String), "timeout_seconds" .= (1 :: Int)]
+      out <- ok env "ghci_eval" ["command" .= ("Control.Concurrent.threadDelay 3000000 >> putStrLn \"done\"" :: Text), "timeout_seconds" .= (1 :: Int)]
       assertContains "still running after 1s" out
       (@?= "done") =<< ok env "ghci_wait" ["timeout_seconds" .= (30 :: Int)]
   , test "refuses new input while a command runs, and interrupts it" $ \env -> do
-      out <- ok env "ghci_eval" ["command" .= ("length [1..]" :: String), "timeout_seconds" .= (1 :: Int)]
+      out <- ok env "ghci_eval" ["command" .= ("length [1..]" :: Text), "timeout_seconds" .= (1 :: Int)]
       assertContains "still running" out
-      failsWith env "ghci_eval" ["command" .= ("1+1" :: String)] "An earlier command is still running"
+      failsWith env "ghci_eval" ["command" .= ("1+1" :: Text)] "An earlier command is still running"
       assertContains "Interrupted." =<< ok env "ghci_interrupt" []
       (@?= "2") =<< eval env "1+1"
   , test "shortens long output and saves all of it" $ \env -> do
-      out <- lines <$> eval env "mapM_ print [1..1000]"
+      out <- T.lines <$> eval env "mapM_ print [1..1000]"
       length out @?= 363
       take 1 out @?= ["1"]
       last out @?= "1000"
-      assertBool "omitted-lines note" (any ("640 lines omitted" `isInfixOf`) out)
-      saved <- readFile (envDir env </> ".shared-ghci" </> "last-output.txt")
-      length (lines saved) @?= 1000
+      assertBool "omitted-lines note" (any ("640 lines omitted" `T.isInfixOf`) out)
+      saved <- TIO.readFile (envDir env </> ".shared-ghci" </> "last-output.txt")
+      length (T.lines saved) @?= 1000
   , test "won't send while the human has typed input at the prompt" $ \env -> do
       envTmux env ["send-keys", "-t", envTarget env, "-l", "map (+1"]
       threadDelay 500000
-      failsWith env "ghci_eval" ["command" .= ("1+1" :: String)] "typed unsent input at the GHCi prompt: \"map (+1\""
+      failsWith env "ghci_eval" ["command" .= ("1+1" :: Text)] "typed unsent input at the GHCi prompt: \"map (+1\""
       envTmux env ["send-keys", "-t", envTarget env, "C-u"]
       threadDelay 500000
       (@?= "2") =<< eval env "1+1"
@@ -104,7 +106,7 @@ tests =
       out <- ok env "ghci_status" ["lines" .= (5 :: Int)]
       assertContains "state:   idle at the prompt" out
   , test "detects that GHCi exited, and restarts it" $ \env -> do
-      failsWith env "ghci_eval" ["command" .= (":quit" :: String)] "GHCi has exited"
+      failsWith env "ghci_eval" ["command" .= (":quit" :: Text)] "GHCi has exited"
       assertContains "GHCi is ready" =<< ok env "ghci_restart" ["timeout_seconds" .= (120 :: Int)]
       (@?= "8") =<< eval env "double 4"
   , test "answers malformed requests with JSON-RPC errors" $ \env -> do
@@ -150,17 +152,17 @@ tests =
 writeWrapper :: FilePath -> IO ()
 writeWrapper dir = do
   let f = dir </> "repl.sh"
-  writeFile f "#!/bin/sh\necho 'starting container...'\nsleep 1\nexec ghci Demo.hs\n"
+  TIO.writeFile f "#!/bin/sh\necho 'starting container...'\nsleep 1\nexec ghci Demo.hs\n"
   p <- getPermissions f
   setPermissions f (setOwnerExecutable True p)
 
 -- | A project .ghci that sets its own prompt, as many do.
-dotGhci :: String
+dotGhci :: Text
 dotGhci = ":set prompt \"my-prompt> \"\n:set prompt-cont \"my-prompt| \"\n"
 
-demoSource :: String
+demoSource :: Text
 demoSource =
-  unlines
+  T.unlines
     [ "module Demo where"
     , ""
     , "double :: Int -> Int"
@@ -168,11 +170,11 @@ demoSource =
     ]
 
 -- | A type error whose message is well over 100 lines long.
-badDefinition :: String
+badDefinition :: Text
 badDefinition =
   "\nbad :: Int\nbad = \"oops\" ++ "
-    ++ foldr1 (\a b -> a ++ " ++ " ++ b) ["show " ++ show i | i <- [0 .. 59 :: Int]]
-    ++ "\n"
+    <> T.intercalate " ++ " ["show " <> T.pack (show i) | i <- [0 .. 59 :: Int]]
+    <> "\n"
 
 ------------------------------------------------------------------------------
 -- Setting up GHCi and the server
@@ -192,11 +194,11 @@ setup = do
   script <- makeAbsolute ("bin" </> "ghci-session")
   tmp <- getCanonicalTemporaryDirectory
   dir <- createTempDirectory tmp "shared-ghci-test"
-  writeFile (dir </> "Demo.hs") demoSource
-  writeFile (dir </> ".ghci") dotGhci
+  TIO.writeFile (dir </> "Demo.hs") demoSource
+  TIO.writeFile (dir </> ".ghci") dotGhci
   callProcessIn dir script ["start", "--", "ghci", "Demo.hs"]
   st <- readState dir
-  let get k = fromMaybe (error ("state file has no " ++ k)) (lookup k st)
+  let get k = T.unpack (fromMaybe (error ("state file has no " ++ T.unpack k)) (lookup k st))
   env <- startServer dir
   pure
     env
@@ -218,8 +220,8 @@ withProject cmd prepare body = do
   script <- makeAbsolute ("bin" </> "ghci-session")
   tmp <- getCanonicalTemporaryDirectory
   bracket (createTempDirectory tmp "shared-ghci-wrapper") removeDirectoryRecursive $ \dir -> do
-    writeFile (dir </> "Demo.hs") demoSource
-    writeFile (dir </> ".ghci") dotGhci
+    TIO.writeFile (dir </> "Demo.hs") demoSource
+    TIO.writeFile (dir </> ".ghci") dotGhci
     prepare dir
     bracket_
       (callProcessIn dir script ("start" : "--" : cmd))
@@ -287,10 +289,10 @@ callProcessIn dir exe args = do
   when (ec /= ExitSuccess) $
     assertFailure (unwords (exe : args) ++ " failed (" ++ show ec ++ "):\n" ++ out ++ err)
 
-readState :: FilePath -> IO [(String, String)]
+readState :: FilePath -> IO [(Text, Text)]
 readState dir = do
-  txt <- readFile (dir </> ".shared-ghci" </> "state")
-  pure [(k, drop 1 v) | l <- lines txt, let (k, v) = break (== '=') l, not (null v)]
+  txt <- TIO.readFile (dir </> ".shared-ghci" </> "state")
+  pure [(k, T.drop 1 v) | l <- T.lines txt, let (k, v) = T.breakOn "=" l, not (T.null v)]
 
 ------------------------------------------------------------------------------
 -- Talking to the server
@@ -312,7 +314,7 @@ rpc env method params = do
   readResponse env
 
 -- | Call a tool; returns (isError, text).
-callTool :: Env -> Text -> [Pair] -> IO (Bool, String)
+callTool :: Env -> Text -> [Pair] -> IO (Bool, Text)
 callTool env name args = do
   r <- rpc env "tools/call" (object ["name" .= name, "arguments" .= object args])
   maybe (assertFailure ("unexpected tools/call response: " ++ show r)) pure (parseMaybe toolResult r)
@@ -322,27 +324,27 @@ callTool env name args = do
       isErr <- res .: "isError"
       content <- res .: "content"
       texts <- mapM (withObject "content" (.: "text")) content
-      pure (isErr, concat (texts :: [String]))
+      pure (isErr, T.concat texts)
 
-ok :: Env -> Text -> [Pair] -> IO String
+ok :: Env -> Text -> [Pair] -> IO Text
 ok env name args = do
   (isErr, out) <- callTool env name args
-  when isErr $ assertFailure (show name ++ " returned an error:\n" ++ out)
+  when isErr $ assertFailure (show name ++ " returned an error:\n" ++ T.unpack out)
   pure out
 
-eval :: Env -> String -> IO String
+eval :: Env -> Text -> IO Text
 eval env cmd = ok env "ghci_eval" ["command" .= cmd]
 
-failsWith :: Env -> Text -> [Pair] -> String -> IO ()
+failsWith :: Env -> Text -> [Pair] -> Text -> IO ()
 failsWith env name args needle = do
   (isErr, out) <- callTool env name args
-  unless isErr $ assertFailure (show name ++ " should have failed, but returned:\n" ++ out)
+  unless isErr $ assertFailure (show name ++ " should have failed, but returned:\n" ++ T.unpack out)
   assertContains needle out
 
 errorCode :: Value -> Maybe Int
 errorCode = parseMaybe (withObject "r" $ \o -> o .: "error" >>= (.: "code"))
 
-assertContains :: String -> String -> Assertion
+assertContains :: Text -> Text -> Assertion
 assertContains needle hay =
-  unless (needle `isInfixOf` hay) $
-    assertFailure ("expected to find " ++ show needle ++ " in:\n" ++ hay)
+  unless (needle `T.isInfixOf` hay) $
+    assertFailure ("expected to find " ++ show needle ++ " in:\n" ++ T.unpack hay)

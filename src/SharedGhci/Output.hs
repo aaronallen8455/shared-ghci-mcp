@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 -- | Pure helpers: marking the end of a command's output, turning raw terminal
 -- output into plain text, preparing input to send, and shortening long output.
 --
@@ -31,52 +33,50 @@ module SharedGhci.Output
   , trimBlankLines
   , summarizeOutput
     -- * Utilities
-  , splitOn
-  , trim
   , lastN
   ) where
 
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Char8 as BC
 import Data.Char (isDigit, isSpace)
 import Data.Foldable (toList)
-import Data.List (dropWhileEnd, intercalate, isInfixOf, isPrefixOf, isSuffixOf)
+import Data.List (dropWhileEnd)
 import Data.Maybe (fromMaybe, listToMaybe)
 import qualified Data.Sequence as Seq
+import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text.Encoding (decodeUtf8With)
+import Data.Text.Encoding (decodeUtf8With, encodeUtf8)
 import Data.Text.Encoding.Error (lenientDecode)
 
 ------------------------------------------------------------------------------
 -- Sentinels
 
-sentinelTag :: String
+sentinelTag :: Text
 sentinelTag = "<<shared-ghci:"
 
 -- | What the typed sentinel line looks like up to its number, as echoed.
-sentinelEchoPrefix :: String
-sentinelEchoPrefix = "System.IO.putStrLn \"" ++ sentinelTag ++ "\\&"
+sentinelEchoPrefix :: Text
+sentinelEchoPrefix = "System.IO.putStrLn \"" <> sentinelTag <> "\\&"
 
 -- | The line to type after a command.
-sentinelCommand :: Integer -> String
-sentinelCommand n = sentinelEchoPrefix ++ show n ++ ">>\""
+sentinelCommand :: Integer -> Text
+sentinelCommand n = sentinelEchoPrefix <> tshow n <> ">>\""
 
 -- | What GHCi prints when it runs @sentinelCommand n@.
 sentinelMarker :: Integer -> BS.ByteString
-sentinelMarker n = BC.pack (sentinelTag ++ show n ++ ">>")
+sentinelMarker n = encodeUtf8 (sentinelTag <> tshow n <> ">>")
 
 -- | Is this cleaned line an echo of any sentinel, or any sentinel's output?
 -- (Used to hide them; markers of earlier, interrupted commands can show up.)
-isSentinelLine :: String -> Bool
-isSentinelLine l = sentinelEchoPrefix `isInfixOf` l || isMarker (trim l)
+isSentinelLine :: Text -> Bool
+isSentinelLine l = sentinelEchoPrefix `T.isInfixOf` l || isMarker (T.strip l)
   where
-    isMarker s = sentinelTag `isPrefixOf` s && ">>" `isSuffixOf` s
+    isMarker s = sentinelTag `T.isPrefixOf` s && ">>" `T.isSuffixOf` s
 
 -- | A finished command.
 data Completion = Completion
-  { cOutput :: [String]
+  { cOutput :: [Text]
   -- ^ the command's output, without the echoed input, sentinel or prompt
-  , cPrompt :: [String]
+  , cPrompt :: [Text]
   -- ^ lines GHCi printed after the marker: its next prompt (possibly
   -- incomplete if read too soon), and any lines such as @it :: ()@ before it
   }
@@ -97,11 +97,11 @@ findCompletion n echoed dat
 
     -- @pre@ ends with GHCi's prompt followed by the echoed sentinel. Text
     -- before the prompt on that line is output without a trailing newline.
-    removeEcho ls = case break (sentinelEchoPrefix `isInfixOf`) (reverse ls) of
+    removeEcho ls = case break (sentinelEchoPrefix `T.isInfixOf`) (reverse ls) of
       (_, []) -> filter (not . isSentinelLine) ls
       (_, echoLine : revBefore) ->
         let before = filter (not . isSentinelLine) (reverse revBefore)
-            x0 = dropWhileEnd isSpace (takeBefore sentinelEchoPrefix echoLine)
+            x0 = T.stripEnd (fst (T.breakOn sentinelEchoPrefix echoLine))
          in stripPrompt before x0 promptLs
 
 -- | Remove the prompt that precedes the echoed sentinel. It is matched
@@ -109,100 +109,104 @@ findCompletion n echoed dat
 -- matching any run of digits (prompts often show a line number or the time).
 -- A prompt can span several lines; the longest tail of 'cPrompt' that
 -- matches is removed.
-stripPrompt :: [String] -> String -> [String] -> [String]
+stripPrompt :: [Text] -> Text -> [Text] -> [Text]
 stripPrompt before x0 promptLs =
   fromMaybe plain (listToMaybe [r | k <- [length promptLs, length promptLs - 1 .. 1], Just r <- [tryK k]])
   where
-    plain = before ++ [x0 | not (null x0)]
+    plain = before ++ [x0 | not (T.null x0)]
     tryK k =
-      let pk = map (dropWhileEnd isSpace) (lastN k promptLs)
+      let pk = map T.stripEnd (lastN k promptLs)
           (pInit, pLast) = (init pk, last pk)
           m = length pInit
        in case promptSuffixLength pLast x0 of
             Just len
               | length before >= m
               , and (zipWith matchesWhole pInit (lastN m before)) ->
-                  let x = dropWhileEnd isSpace (take (length x0 - len) x0)
-                   in Just (take (length before - m) before ++ [x | not (null x)])
+                  let x = T.stripEnd (T.dropEnd len x0)
+                   in Just (take (length before - m) before ++ [x | not (T.null x)])
             _ -> Nothing
-    matchesWhole p l = promptSuffixLength p l == Just (length l)
+    matchesWhole p l = promptSuffixLength p l == Just (T.length l)
 
 -- | If @s@ ends with text matching prompt @p@, the length of that text. Each
 -- run of digits in @p@ matches any non-empty run of digits.
-promptSuffixLength :: String -> String -> Maybe Int
-promptSuffixLength p s = go (reverse p) (reverse s) 0
+promptSuffixLength :: Text -> Text -> Maybe Int
+promptSuffixLength p s = go (T.reverse p) (T.reverse s) 0
   where
-    go [] _ n = Just n
-    go pr@(c : _) sr n
-      | isDigit c =
-          let (ds, sr') = span isDigit sr
-           in if null ds then Nothing else go (dropWhile isDigit pr) sr' (n + length ds)
-    go (c : pr) (d : sr) n | c == d = go pr sr (n + 1)
-    go _ _ _ = Nothing
+    go pr sr n = case T.uncons pr of
+      Nothing -> Just n
+      Just (c, pr')
+        | isDigit c ->
+            let (ds, sr') = T.span isDigit sr
+             in if T.null ds then Nothing else go (T.dropWhile isDigit pr) sr' (n + T.length ds)
+        | otherwise -> case T.uncons sr of
+            Just (d, sr') | c == d -> go pr' sr' (n + 1)
+            _ -> Nothing
 
 -- | Output so far of a command that hasn't finished, with input echo and
 -- sentinel lines removed.
-partialOutput :: Int -> BS.ByteString -> [String]
+partialOutput :: Int -> BS.ByteString -> [Text]
 partialOutput echoed = filter (not . isSentinelLine) . drop echoed . clean
 
 -- | The last (unterminated) line of terminal output: at an idle GHCi, its
 -- prompt plus anything typed but not yet entered.
-trailingLine :: BS.ByteString -> String
+trailingLine :: BS.ByteString -> Text
 trailingLine dat = case clean dat of
   [] -> ""
   ls -> last ls
-
-takeBefore :: String -> String -> String
-takeBefore needle = go []
-  where
-    go acc s@(c : r)
-      | needle `isPrefixOf` s = reverse acc
-      | otherwise = go (c : acc) r
-    go acc [] = reverse acc
 
 ------------------------------------------------------------------------------
 -- Cleaning terminal output
 
 -- | Decode UTF-8, replacing invalid bytes with U+FFFD.
-decodeLenient :: BS.ByteString -> String
-decodeLenient = T.unpack . decodeUtf8With lenientDecode
+decodeLenient :: BS.ByteString -> Text
+decodeLenient = decodeUtf8With lenientDecode
 
 -- | Turn raw terminal output into lines of plain text.
-clean :: BS.ByteString -> [String]
-clean = map (renderLine . dropWhileEnd (== '\r')) . splitOn '\n' . stripAnsi . decodeLenient
+clean :: BS.ByteString -> [Text]
+clean = map (renderLine . T.dropWhileEnd (== '\r')) . T.splitOn "\n" . stripAnsi . decodeLenient
 
 -- | Remove terminal escape sequences (colours, cursor movement, titles) and
 -- bell characters.
-stripAnsi :: String -> String
-stripAnsi s = case s of
-  '\ESC' : '[' : r -> stripAnsi (drop 1 (dropWhile (not . csiFinal) r))
-  '\ESC' : ']' : r -> stripAnsi (dropOsc r)
-  '\ESC' : c : _ : r | c `elem` "()" -> stripAnsi r
-  '\ESC' : c : r | (c >= '@' && c <= '_') || c `elem` "=>" -> stripAnsi r
-  '\ESC' : r -> stripAnsi r
-  '\a' : r -> stripAnsi r
-  c : r -> c : stripAnsi r
-  [] -> []
+stripAnsi :: Text -> Text
+stripAnsi = T.concat . go
   where
+    go t =
+      let (plain, rest) = T.break (\c -> c == '\ESC' || c == '\a') t
+       in plain : case T.uncons rest of
+            Nothing -> []
+            Just ('\a', r) -> go r
+            Just (_, r) -> go (skipEscape r)
+    -- the text after an ESC, with the rest of the escape sequence removed
+    skipEscape r = case T.uncons r of
+      Just ('[', r') -> T.drop 1 (T.dropWhile (not . csiFinal) r') -- CSI
+      Just (']', r') -> dropOsc r' -- OSC
+      Just (c, r')
+        | c == '(' || c == ')' -> T.drop 1 r' -- charset selection
+        | (c >= '@' && c <= '_') || c == '=' || c == '>' -> r' -- 2-byte escapes
+      _ -> r
     csiFinal c = c >= '@' && c <= '~'
-    dropOsc ('\a' : r) = r
-    dropOsc ('\ESC' : '\\' : r) = r
-    dropOsc (_ : r) = dropOsc r
-    dropOsc [] = []
+    -- OSC ends with BEL or ESC \
+    dropOsc r =
+      let rest = T.dropWhile (\c -> c /= '\a' && c /= '\ESC') r
+       in case T.uncons rest of
+            Just ('\a', r') -> r'
+            Just (_, r') -> case T.uncons r' of
+              Just ('\\', r'') -> r''
+              _ -> dropOsc r'
+            Nothing -> T.empty
 
 -- | Apply carriage returns and backspaces within one line the way a terminal
 -- would, and drop trailing whitespace.
-renderLine :: String -> String
+renderLine :: Text -> Text
 renderLine l
-  | all (\c -> c /= '\r' && c /= '\b') l = dropWhileEnd isSpace l
-  | otherwise = dropWhileEnd isSpace (toList (go Seq.empty 0 l))
+  | not (T.any (\c -> c == '\r' || c == '\b') l) = T.stripEnd l
+  | otherwise = T.stripEnd (T.pack (toList (fst (T.foldl' step (Seq.empty, 0) l))))
   where
-    go buf _ [] = buf
-    go buf _ ('\r' : r) = go buf 0 r
-    go buf p ('\b' : r) = go buf (max 0 (p - 1)) r
-    go buf p (c : r)
-      | p < Seq.length buf = go (Seq.update p c buf) (p + 1) r
-      | otherwise = go (buf Seq.|> c) (p + 1) r
+    step (buf, _) '\r' = (buf, 0)
+    step (buf, p) '\b' = (buf, max 0 (p - 1))
+    step (buf, p) c
+      | p < Seq.length buf = (Seq.update p c buf, p + 1)
+      | otherwise = (buf Seq.|> c, p + 1 :: Int)
 
 ------------------------------------------------------------------------------
 -- Input
@@ -210,14 +214,14 @@ renderLine l
 -- | Split input into the lines to type into GHCi. Tabs become spaces (a tab
 -- would trigger completion), trailing blank lines are dropped, and multi-line
 -- input is wrapped in @:{@ / @:}@ unless it already is. Empty input gives @[]@.
-prepareInput :: String -> [String]
+prepareInput :: Text -> [Text]
 prepareInput command
-  | length ls > 1 && map trim (take 1 ls) /= [":{"] = [":{"] ++ ls ++ [":}"]
+  | length ls > 1 && map T.strip (take 1 ls) /= [":{"] = [":{"] ++ ls ++ [":}"]
   | otherwise = ls
   where
-    expand '\t' = "    "
-    expand c = [c]
-    ls = dropWhileEnd (all isSpace) (splitOn '\n' (concatMap expand (filter (/= '\r') command)))
+    ls =
+      dropWhileEnd (T.all isSpace) . T.splitOn "\n" . T.replace "\t" "    " $
+        T.filter (/= '\r') command
 
 ------------------------------------------------------------------------------
 -- Long output
@@ -228,22 +232,22 @@ maxLines = 400
 headLines = 300
 tailLines = 60
 
-trimBlankLines :: [String] -> [String]
-trimBlankLines = dropWhile null . dropWhileEnd null
+trimBlankLines :: [Text] -> [Text]
+trimBlankLines = dropWhile T.null . dropWhileEnd T.null
 
 -- | Join already-trimmed lines for the agent. More than 'maxLines' lines are
 -- cut to the first 'headLines' and last 'tailLines', with a note saying the
 -- full output is at the given path (the caller writes that file).
-summarizeOutput :: FilePath -> [String] -> String
+summarizeOutput :: FilePath -> [Text] -> Text
 summarizeOutput savedTo ls
   | null ls = "(no output)"
-  | n <= maxLines = intercalate "\n" ls
+  | n <= maxLines = T.intercalate "\n" ls
   | otherwise =
-      intercalate "\n" $
+      T.intercalate "\n" $
         take headLines ls
           ++ [ ""
-             , "... [" ++ show (n - headLines - tailLines) ++ " lines omitted; full output ("
-                 ++ show n ++ " lines) saved to " ++ savedTo ++ "] ..."
+             , "... [" <> tshow (n - headLines - tailLines) <> " lines omitted; full output ("
+                 <> tshow n <> " lines) saved to " <> T.pack savedTo <> "] ..."
              , ""
              ]
           ++ lastN tailLines ls
@@ -253,13 +257,8 @@ summarizeOutput savedTo ls
 ------------------------------------------------------------------------------
 -- Utilities
 
-splitOn :: Char -> String -> [String]
-splitOn c s = case break (== c) s of
-  (a, []) -> [a]
-  (a, _ : r) -> a : splitOn c r
-
-trim :: String -> String
-trim = dropWhileEnd isSpace . dropWhile isSpace
-
 lastN :: Int -> [a] -> [a]
 lastN k xs = drop (length xs - k) xs
+
+tshow :: Show a => a -> Text
+tshow = T.pack . show

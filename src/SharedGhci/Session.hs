@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Driving a GHCi session that runs in tmux (started by @ghci-session@).
@@ -23,7 +24,10 @@ import Control.Exception
 import Control.Monad (when)
 import qualified Data.ByteString as BS
 import Data.IORef
-import Data.List (dropWhileEnd, intercalate, isPrefixOf)
+import Data.List (dropWhileEnd)
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Clock (getMonotonicTime)
@@ -35,15 +39,17 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO
 import System.Process (readProcessWithExitCode)
 
-newtype GhciError = GhciError String
+newtype GhciError = GhciError Text
   deriving (Show)
 
 instance Exception GhciError
 
-throwG :: String -> IO a
+throwG :: Text -> IO a
 throwG = throwIO . GhciError
 
--- | Contents of @.shared-ghci/state@, written by @ghci-session start@.
+-- | Contents of @.shared-ghci/state@, written by @ghci-session start@. Paths
+-- and tmux arguments are 'String' because that is what the process and
+-- filepath APIs take.
 data State = State
   { stSession :: String
   , stSocket :: String
@@ -66,7 +72,7 @@ data Pending = Pending
 
 data Session = Session
   { sPending :: IORef (Maybe Pending)
-  , sPrompt :: IORef (Maybe String)
+  , sPrompt :: IORef (Maybe Text)
   -- ^ last line of the prompt GHCi showed after our latest sentinel
   , sNextSentinel :: IORef Integer
   }
@@ -103,14 +109,14 @@ loadState = do
             if p == d
               then
                 throwG $
-                  "No shared GHCi session found for " ++ start
-                    ++ ". Ask the user to run `ghci-session start` (or "
-                    ++ "`ghci-session start -- <repl command>`) in the project root."
+                  "No shared GHCi session found for " <> T.pack start
+                    <> ". Ask the user to run `ghci-session start` (or "
+                    <> "`ghci-session start -- <repl command>`) in the project root."
               else walk p
   (dir, file) <- walk =<< makeAbsolute start
   txt <- decodeLenient <$> BS.readFile file
-  let kvs = [(k, drop 1 v) | l <- lines txt, let (k, v) = break (== '=') l, not (null v)]
-      get k = maybe "" id (lookup k kvs)
+  let kvs = [(k, T.drop 1 v) | l <- T.lines txt, let (k, v) = T.breakOn "=" l, not (T.null v)]
+      get k = maybe "" T.unpack (lookup k kvs)
   pure
     State
       { stSession = get "session"
@@ -130,7 +136,7 @@ tmuxOk st args = do
   (ec, _, err) <- tmux st args
   case ec of
     ExitSuccess -> pure ()
-    _ -> throwG ("tmux " ++ unwords (take 1 args) ++ " failed: " ++ trim err)
+    _ -> throwG ("tmux " <> T.pack (unwords (take 1 args)) <> " failed: " <> T.strip (T.pack err))
 
 -- | The active pane of the exactly-named session.
 paneTarget :: State -> String
@@ -139,8 +145,9 @@ paneTarget st = "=" ++ stSession st ++ ":"
 -- | Type lines into GHCi, each followed by Enter, in a single write. Sending
 -- them together means they arrive while GHCi is reading input, so the
 -- terminal doesn't echo the later lines into the middle of the output.
-typeLines :: State -> [String] -> IO ()
-typeLines st ls = tmuxOk st ["send-keys", "-t", paneTarget st, "-l", "--", concatMap (++ "\r") ls]
+typeLines :: State -> [Text] -> IO ()
+typeLines st ls =
+  tmuxOk st ["send-keys", "-t", paneTarget st, "-l", "--", T.unpack (T.concat (map (<> "\r") ls))]
 
 data PaneState = Running | Dead | Missing
   deriving (Eq)
@@ -149,7 +156,7 @@ paneState :: State -> IO PaneState
 paneState st = do
   (ec, out, _) <- tmux st ["display-message", "-p", "-t", paneTarget st, "#{pane_dead}"]
   pure $ case ec of
-    ExitSuccess | trim out == "1" -> Dead
+    ExitSuccess | T.strip (T.pack out) == "1" -> Dead
     ExitSuccess -> Running
     _ -> Missing
 
@@ -160,14 +167,14 @@ requireRunning st = do
     Running -> pure ()
     Missing ->
       throwG $
-        "The GHCi tmux session '" ++ stSession st ++ "' is not running. Ask the "
-          ++ "user to run `ghci-session start` in the project root."
+        "The GHCi tmux session '" <> T.pack (stSession st) <> "' is not running. Ask the "
+          <> "user to run `ghci-session start` in the project root."
     Dead -> do
       t <- logTail st 40
       throwG $
         "GHCi has exited (it was quit, crashed, or failed to start). Last output:\n\n"
-          ++ t
-          ++ "\n\nFix any problem shown, then call ghci_restart."
+          <> t
+          <> "\n\nFix any problem shown, then call ghci_restart."
 
 ------------------------------------------------------------------------------
 -- Reading the log
@@ -188,20 +195,20 @@ logTailBytes st n = do
   readLog st (max 0 (size - n)) (Just size)
 
 -- | The last @n@ lines of the log as plain text, without sentinel lines.
-logTail :: State -> Int -> IO String
+logTail :: State -> Int -> IO Text
 logTail st n = do
   dat <- logTailBytes st (64 * 1024)
-  let ls = dropWhileEnd null (filter (not . isSentinelLine) (clean dat))
-  pure (intercalate "\n" (lastN n ls))
+  let ls = dropWhileEnd T.null (filter (not . isSentinelLine) (clean dat))
+  pure (T.intercalate "\n" (lastN n ls))
 
 -- | Text typed at GHCi's prompt but not yet entered, if we can tell. Only
 -- known once we've seen GHCi's prompt after one of our sentinels.
-unsentInput :: Session -> State -> IO (Maybe String)
+unsentInput :: Session -> State -> IO (Maybe Text)
 unsentInput sess st = do
   mp <- readIORef (sPrompt sess)
   t <- trailingLine <$> logTailBytes st 4096
   pure $ case mp of
-    Just p | not (null p), t /= p, p `isPrefixOf` t -> Just (trim (drop (length p) t))
+    Just p | not (T.null p), t /= p, p `T.isPrefixOf` t -> Just (T.strip (T.drop (T.length p) t))
     _ -> Nothing
 
 refuseIfUnsentInput :: Session -> State -> IO ()
@@ -211,16 +218,16 @@ refuseIfUnsentInput sess st = do
     Nothing -> pure ()
     Just typed ->
       throwG $
-        "Someone has typed unsent input at the GHCi prompt: \"" ++ lastN 200 typed
-          ++ "\". Ask the user to finish or clear it; ghci_interrupt would discard it."
+        "Someone has typed unsent input at the GHCi prompt: \"" <> T.takeEnd 200 typed
+          <> "\". Ask the user to finish or clear it; ghci_interrupt would discard it."
 
 -- | Shorten output for the agent, saving the full text if it was cut.
-formatOutput :: State -> [String] -> IO String
+formatOutput :: State -> [Text] -> IO Text
 formatOutput st ls0 = do
   let ls = trimBlankLines ls0
       path = stStateDir st </> "last-output.txt"
   when (length ls > maxLines) $
-    withFile path WriteMode $ \h -> hSetEncoding h utf8 >> hPutStr h (unlines ls)
+    withFile path WriteMode $ \h -> hSetEncoding h utf8 >> TIO.hPutStr h (T.unlines ls)
   pure (summarizeOutput path ls)
 
 ------------------------------------------------------------------------------
@@ -237,7 +244,7 @@ pendingFor sess st = do
     _ -> Nothing
 
 -- | Type @ls@ followed by a new sentinel, and record it as pending.
-startPending :: Session -> State -> [String] -> Bool -> IO ()
+startPending :: Session -> State -> [Text] -> Bool -> IO ()
 startPending sess st ls probe = do
   n <- nextSentinel sess
   size <- logSize st
@@ -245,7 +252,7 @@ startPending sess st ls probe = do
   typeLines st (ls ++ [sentinelCommand n])
 
 -- | Send GHCi input and wait up to @timeout@ seconds for its output.
-sendCommand :: Session -> String -> Double -> IO String
+sendCommand :: Session -> Text -> Double -> IO Text
 sendCommand sess command timeout = do
   st <- loadState
   requireRunning st
@@ -265,7 +272,7 @@ sendCommand sess command timeout = do
   snd <$> waitPending sess st timeout
 
 -- | Wait for the pending sentinel. Returns whether it arrived, and the output.
-waitPending :: Session -> State -> Double -> IO (Bool, String)
+waitPending :: Session -> State -> Double -> IO (Bool, Text)
 waitPending sess st timeout = do
   p <- maybe (throwG "nothing is pending") pure =<< readIORef (sPending sess)
   deadline <- (+ timeout) <$> getMonotonicTime
@@ -281,12 +288,12 @@ waitPending sess st timeout = do
           Just _ -> do
             c <- awaitPrompt (10 :: Int)
             writeIORef (sPending sess) Nothing
-            case filter (not . null) (cPrompt c) of
+            case filter (not . T.null) (cPrompt c) of
               [] -> pure ()
               ps -> writeIORef (sPrompt sess) (Just (last ps))
             out <- formatOutput st (cOutput c)
             if pProbe p
-              then (,) True . ("GHCi is ready. Recent output:\n\n" ++) <$> logTail st 40
+              then (,) True . ("GHCi is ready. Recent output:\n\n" <>) <$> logTail st 40
               else pure (True, out)
           Nothing -> do
             now <- getMonotonicTime
@@ -297,16 +304,16 @@ waitPending sess st timeout = do
                     t <- logTail st 20
                     pure
                       ( False
-                      , "GHCi isn't ready after " ++ showSecs timeout ++ "s (still starting, "
-                          ++ "or busy). Call ghci_wait again to keep waiting. Recent output:\n\n"
-                          ++ t
+                      , "GHCi isn't ready after " <> showSecs timeout <> "s (still starting, "
+                          <> "or busy). Call ghci_wait again to keep waiting. Recent output:\n\n"
+                          <> t
                       )
                   else do
                     partial <- formatOutput st (partialOutput (pLines p) dat)
                     pure
                       ( False
-                      , partial ++ "\n\n[still running after " ++ showSecs timeout
-                          ++ "s: call ghci_wait to keep waiting, or ghci_interrupt to cancel]"
+                      , partial <> "\n\n[still running after " <> showSecs timeout
+                          <> "s: call ghci_wait to keep waiting, or ghci_interrupt to cancel]"
                       )
               else do
                 ps <- paneState st
@@ -321,12 +328,12 @@ waitPending sess st timeout = do
         dat <- readSince
         case findCompletion (pSentinel p) (pLines p) dat of
           Just c
-            | tries <= 0 || any (not . null) (cPrompt c) -> pure c
+            | tries <= 0 || any (not . T.null) (cPrompt c) -> pure c
           _ -> threadDelay 50000 >> awaitPrompt (tries - 1)
   loop
 
 -- | Wait for a pending command, or else for GHCi to be ready for input.
-waitCmd :: Session -> Double -> IO String
+waitCmd :: Session -> Double -> IO Text
 waitCmd sess timeout = do
   st <- loadState
   requireRunning st
@@ -339,7 +346,7 @@ waitCmd sess timeout = do
       startPending sess st [] True
       snd <$> waitPending sess st timeout
 
-interrupt :: Session -> IO String
+interrupt :: Session -> IO Text
 interrupt sess = do
   st <- loadState
   requireRunning st
@@ -355,10 +362,9 @@ interrupt sess = do
         Nothing -> Pending size n 0 False (stLog st)
   writeIORef (sPending sess) (Just p)
   typeLines st [sentinelCommand n]
-  (_, out) <- waitPending sess st 10
-  pure out
+  snd <$> waitPending sess st 10
 
-restart :: Session -> Double -> IO String
+restart :: Session -> Double -> IO Text
 restart sess timeout = do
   st <- loadState
   ps <- paneState st
@@ -375,7 +381,7 @@ restart sess timeout = do
   threadDelay 200000
   waitCmd sess timeout
 
-status :: Session -> Int -> IO String
+status :: Session -> Int -> IO Text
 status sess n = do
   st <- loadState
   ps <- paneState st
@@ -386,30 +392,30 @@ status sess n = do
       pend <- pendingFor sess st
       u <- unsentInput sess st
       mp <- readIORef (sPrompt sess)
-      t <- trailingLine <$> logTailBytes st 4096
+      trailing <- trailingLine <$> logTailBytes st 4096
       pure $ case (pend, u) of
         (Just p, _)
           | pProbe p -> "starting up, or busy (ghci_wait to keep waiting)"
           | otherwise -> "running a command sent by the agent (ghci_wait to collect it)"
-        (_, Just typed) -> "someone has typed unsent input at the prompt: \"" ++ typed ++ "\""
+        (_, Just typed) -> "someone has typed unsent input at the prompt: \"" <> typed <> "\""
         _
-          | Just t == mp -> "idle at the prompt"
+          | Just trailing == mp -> "idle at the prompt"
           | otherwise -> "unknown: may be starting or running something (ghci_wait checks)"
-  t <- logTail st n
+  recent <- logTail st n
   pure $
-    intercalate
+    T.intercalate
       "\n"
-      [ "session: " ++ stSession st ++ " (tmux -L " ++ stSocket st ++ ")"
-      , "command: " ++ stCmd st
-      , "log:     " ++ stLog st
-      , "state:   " ++ stateLine
+      [ "session: " <> T.pack (stSession st) <> " (tmux -L " <> T.pack (stSocket st) <> ")"
+      , "command: " <> T.pack (stCmd st)
+      , "log:     " <> T.pack (stLog st)
+      , "state:   " <> stateLine
       ]
-      ++ "\n\nRecent output:\n\n"
-      ++ t
+      <> "\n\nRecent output:\n\n"
+      <> recent
 
-showSecs :: Double -> String
+showSecs :: Double -> Text
 showSecs d
-  | d == fromIntegral r = show r
-  | otherwise = show d
+  | d == fromIntegral r = T.pack (show r)
+  | otherwise = T.pack (show d)
   where
     r = round d :: Integer
