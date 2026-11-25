@@ -1,0 +1,63 @@
+cabal-version:      3.0
+name:               shared-ghci
+version:            0.1.0
+synopsis:           MCP server for a GHCi session shared between a human (in tmux) and an AI agent
+license:            NONE
+build-type:         Simple
+extra-doc-files:    README.md
+
+common shared
+  default-language: Haskell2010
+  ghc-options:      -Wall
+  build-depends:    base >=4.14 && <5
+
+library
+  import:           shared
+  hs-source-dirs:   src
+  exposed-modules:  SharedGhci.Output
+                    SharedGhci.Session
+  build-depends:    bytestring
+                  , containers
+                  , directory >=1.3
+                  , filepath
+                  , process
+                  , text
+                  , time
+
+executable shared-ghci-mcp
+  import:           shared
+  hs-source-dirs:   app
+  main-is:          Main.hs
+  build-depends:    shared-ghci
+                  , aeson >=2.0 && <2.3
+                  , bytestring
+                  , text
+
+-- Fast, pure tests of output parsing and input preparation.
+test-suite unit
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Unit.hs
+  build-depends:    shared-ghci
+                  , bytestring
+                  , tasty
+                  , tasty-hunit
+
+-- Starts a real GHCi with bin/ghci-session and drives it through the MCP
+-- server. Needs tmux and ghci; skipped (with a message) if tmux is missing.
+test-suite integration
+  import:           shared
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Integration.hs
+  build-tool-depends: shared-ghci:shared-ghci-mcp
+  build-depends:    aeson >=2.0 && <2.3
+                  , bytestring
+                  , directory
+                  , filepath
+                  , process
+                  , tasty >=1.5.3
+                  , tasty-hunit
+                  , temporary
+                  , text
