@@ -23,7 +23,7 @@ import Control.Monad (forM_, unless, when)
 import qualified Data.ByteString as BS
 import Data.IORef
 import Data.List (dropWhileEnd, intercalate)
-import Data.Time (defaultTimeLocale, formatTime, getZonedTime)
+import Data.Time (defaultTimeLocale, diffUTCTime, formatTime, getCurrentTime, getZonedTime)
 import GHC.Clock (getMonotonicTime)
 import SharedGhci.Output
 import System.Directory
@@ -202,12 +202,22 @@ idleStatus st = do
       where
         typed = trim (concat (clean rest))
 
--- | For sessions whose command couldn't be given -ghci-script (wrapper
--- scripts, docker, ...), type the prompt setup into GHCi once its startup
--- banner has appeared and no numbered prompt has followed it. Done once per
--- banner, so it happens again after every restart.
+-- | Make sure GHCi is using the numbered prompt the server relies on, by
+-- typing 'promptSetup' into it when needed. Once GHCi's startup banner has
+-- appeared, GHCi owns the terminal, so typed input reaches it (it reads it
+-- after its startup files and module loading).
+--
+-- * Sessions started through a wrapper ("typed") get the setup as soon as the
+--   banner appears.
+-- * Sessions started with -ghci-script ("script") normally set the prompt
+--   themselves, but a startup file loaded after ours can override it. If no
+--   numbered prompt has appeared since the banner and the log has been quiet
+--   for 'quietSeconds', GHCi is presumably waiting at some other prompt, so
+--   the setup is typed then.
+--
+-- Done at most once per banner, so it happens again after every restart.
 ensurePrompt :: Session -> State -> IO ()
-ensurePrompt sess st = when (stInit st == "typed") $ do
+ensurePrompt sess st = do
   size <- logSize st
   let start = max 0 (size - 256 * 1024)
   dat <- readLog st start (Just size)
@@ -218,10 +228,25 @@ ensurePrompt sess st = when (stInit st == "typed") $ do
           numberedPromptSince = any ((> b) . promptStart) (prompts dat)
       sent <- readIORef (sSetupSent sess)
       unless (numberedPromptSince || sent == Just key) $ do
-        writeIORef (sSetupSent sess) (Just key)
-        forM_ promptSetup $ \l -> do
-          tmuxOk st ["send-keys", "-t", paneTarget st, "-l", "--", l]
-          tmuxOk st ["send-keys", "-t", paneTarget st, "Enter"]
+        due <- if stInit st == "typed" then pure True else logQuietFor quietSeconds
+        when due $ do
+          writeIORef (sSetupSent sess) (Just key)
+          forM_ promptSetup $ \l -> do
+            tmuxOk st ["send-keys", "-t", paneTarget st, "-l", "--", l]
+            tmuxOk st ["send-keys", "-t", paneTarget st, "Enter"]
+  where
+    logQuietFor secs = do
+      r <- try (getModificationTime (stLog st))
+      case r of
+        Left (_ :: IOException) -> pure False
+        Right mtime -> do
+          now <- getCurrentTime
+          pure (realToFrac (diffUTCTime now mtime) >= secs)
+
+-- | How long a script-mode session must show no output, with no numbered
+-- prompt since startup, before the prompt setup is typed.
+quietSeconds :: Double
+quietSeconds = 3
 
 -- | Shorten output for the agent, saving the full text if it was cut.
 formatOutput :: State -> [String] -> IO String

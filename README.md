@@ -111,8 +111,11 @@ You may want to add this to a project's `CLAUDE.md`:
 
 ## Caveats
 
-- If you change the prompt (`:set prompt...`), the agent can no longer tell
-  where output ends. `ghci_restart` restores it.
+- A `.ghci` or other startup script that sets its own prompt is fine. If one
+  runs after the prompt setup and overrides it, the server notices that GHCi
+  started but showed no `[ghci#N]> ` prompt for 3 seconds, and types the setup
+  again. If you change the prompt by hand later in a session, though, the
+  agent can no longer tell where output ends. `ghci_restart` fixes it.
 - Escape sequences are removed from the output the agent sees, including any
   that your program prints on purpose.
 - Project paths containing spaces don't work with `cabal`, `stack` or `ghci`

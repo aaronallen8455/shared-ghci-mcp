@@ -127,6 +127,13 @@ tests =
           -- the setup must be typed again after a restart
           assertContains "GHCi is ready" =<< ok env "ghci_restart" ["timeout_seconds" .= (120 :: Int)]
           (@?= "8") =<< eval env "double 4"
+  , test "repairs the prompt when a later startup script overrides it" $ \_ ->
+      withProject
+        ["ghci", "Demo.hs", "-ghci-script={ghci_script}", "-ghci-script=override.ghci"]
+        (\dir -> writeFile (dir </> "override.ghci") dotGhci)
+        $ \dir -> withServer dir $ \env -> do
+          assertContains "GHCi is ready" =<< ok env "ghci_wait" ["timeout_seconds" .= (60 :: Int)]
+          (@?= "42") =<< eval env "double 21"
   , test "explains when there is no session" $ \_ -> do
       tmp <- getCanonicalTemporaryDirectory
       bracket (createTempDirectory tmp "no-session") removeDirectoryRecursive $ \dir ->
@@ -146,6 +153,10 @@ writeWrapper dir = do
   writeFile f "#!/bin/sh\necho 'starting container...'\nsleep 1\nexec ghci Demo.hs\n"
   p <- getPermissions f
   setPermissions f (setOwnerExecutable True p)
+
+-- | A project .ghci that sets its own prompt, as many do.
+dotGhci :: String
+dotGhci = ":set prompt \"my-prompt> \"\n:set prompt-cont \"my-prompt| \"\n"
 
 demoSource :: String
 demoSource =
@@ -182,6 +193,7 @@ setup = do
   tmp <- getCanonicalTemporaryDirectory
   dir <- createTempDirectory tmp "shared-ghci-test"
   writeFile (dir </> "Demo.hs") demoSource
+  writeFile (dir </> ".ghci") dotGhci
   callProcessIn dir script ["start", "--", "ghci", "Demo.hs"]
   st <- readState dir
   let get k = fromMaybe (error ("state file has no " ++ k)) (lookup k st)
@@ -207,6 +219,7 @@ withProject cmd prepare body = do
   tmp <- getCanonicalTemporaryDirectory
   bracket (createTempDirectory tmp "shared-ghci-wrapper") removeDirectoryRecursive $ \dir -> do
     writeFile (dir </> "Demo.hs") demoSource
+    writeFile (dir </> ".ghci") dotGhci
     prepare dir
     bracket_
       (callProcessIn dir script ("start" : "--" : cmd))
