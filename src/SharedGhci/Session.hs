@@ -49,6 +49,7 @@ data State = State
   , stLog :: FilePath
   , stDir :: FilePath
   , stCmd :: String
+  , stInit :: String -- ^ "script" or "typed": how the prompt gets set up
   , stStateDir :: FilePath
   }
 
@@ -60,10 +61,14 @@ data Pending = Pending
   , pLog :: FilePath
   }
 
-newtype Session = Session (IORef (Maybe Pending))
+data Session = Session
+  { sPending :: IORef (Maybe Pending)
+  , sSetupSent :: IORef (Maybe (FilePath, Integer))
+  -- ^ log and banner offset we last typed the prompt setup for
+  }
 
 newSession :: IO Session
-newSession = Session <$> newIORef Nothing
+newSession = Session <$> newIORef Nothing <*> newIORef Nothing
 
 pollMicros :: Int
 pollMicros = 100000
@@ -106,6 +111,7 @@ loadState = do
       , stLog = get "log"
       , stDir = get "dir"
       , stCmd = get "cmd"
+      , stInit = get "init"
       , stStateDir = dir </> stateDirName
       }
 
@@ -196,6 +202,27 @@ idleStatus st = do
       where
         typed = trim (concat (clean rest))
 
+-- | For sessions whose command couldn't be given -ghci-script (wrapper
+-- scripts, docker, ...), type the prompt setup into GHCi once its startup
+-- banner has appeared and no numbered prompt has followed it. Done once per
+-- banner, so it happens again after every restart.
+ensurePrompt :: Session -> State -> IO ()
+ensurePrompt sess st = when (stInit st == "typed") $ do
+  size <- logSize st
+  let start = max 0 (size - 256 * 1024)
+  dat <- readLog st start (Just size)
+  case lastBanner dat of
+    Nothing -> pure () -- GHCi hasn't started yet
+    Just b -> do
+      let key = (stLog st, start + fromIntegral b)
+          numberedPromptSince = any ((> b) . promptStart) (prompts dat)
+      sent <- readIORef (sSetupSent sess)
+      unless (numberedPromptSince || sent == Just key) $ do
+        writeIORef (sSetupSent sess) (Just key)
+        forM_ promptSetup $ \l -> do
+          tmuxOk st ["send-keys", "-t", paneTarget st, "-l", "--", l]
+          tmuxOk st ["send-keys", "-t", paneTarget st, "Enter"]
+
 -- | Shorten output for the agent, saving the full text if it was cut.
 formatOutput :: State -> [String] -> IO String
 formatOutput st ls0 = do
@@ -210,7 +237,8 @@ formatOutput st ls0 = do
 
 -- | Send GHCi input and wait up to @timeout@ seconds for its output.
 sendCommand :: Session -> String -> Double -> IO String
-sendCommand sess@(Session ref) command timeout = do
+sendCommand sess command timeout = do
+  let ref = sPending sess
   st <- loadState
   requireRunning st
   pend <- readIORef ref
@@ -221,6 +249,7 @@ sendCommand sess@(Session ref) command timeout = do
             "An earlier command is still running. Use ghci_wait to keep waiting \
             \for it, or ghci_interrupt to cancel it."
     _ -> writeIORef ref Nothing
+  ensurePrompt sess st
   (idle, why) <- idleStatus st
   unless idle $ do
     t <- logTail st 15
@@ -238,7 +267,8 @@ sendCommand sess@(Session ref) command timeout = do
   waitPending sess st timeout
 
 waitPending :: Session -> State -> Double -> IO String
-waitPending (Session ref) st timeout = do
+waitPending sess st timeout = do
+  let ref = sPending sess
   p <- maybe (throwG "no command is pending") pure =<< readIORef ref
   deadline <- (+ timeout) <$> getMonotonicTime
   let loop = do
@@ -270,7 +300,8 @@ waitPending (Session ref) st timeout = do
 
 -- | Wait for a pending command, or else for GHCi to become ready.
 waitCmd :: Session -> Double -> IO String
-waitCmd sess@(Session ref) timeout = do
+waitCmd sess timeout = do
+  let ref = sPending sess
   st <- loadState
   requireRunning st
   pend <- readIORef ref
@@ -280,6 +311,7 @@ waitCmd sess@(Session ref) timeout = do
       writeIORef ref Nothing
       deadline <- (+ timeout) <$> getMonotonicTime
       let loop = do
+            ensurePrompt sess st
             (idle, why) <- idleStatus st
             if idle
               then ("GHCi is ready. Recent output:\n\n" ++) <$> logTail st 40
@@ -295,7 +327,8 @@ waitCmd sess@(Session ref) timeout = do
       loop
 
 interrupt :: Session -> IO String
-interrupt sess@(Session ref) = do
+interrupt sess = do
+  let ref = sPending sess
   st <- loadState
   requireRunning st
   pend <- readIORef ref
@@ -309,7 +342,8 @@ interrupt sess@(Session ref) = do
   waitPending sess st 10
 
 restart :: Session -> Double -> IO String
-restart sess@(Session ref) timeout = do
+restart sess timeout = do
+  let ref = sPending sess
   st <- loadState
   ps <- paneState st
   when (ps == Missing) $ requireRunning st
@@ -327,11 +361,13 @@ restart sess@(Session ref) timeout = do
   waitCmd sess timeout
 
 status :: Session -> Int -> IO String
-status (Session ref) n = do
+status sess n = do
+  let ref = sPending sess
   st <- loadState
   ps <- paneState st
   stateLine <- case ps of
     Running -> do
+      ensurePrompt sess st
       (idle, why) <- idleStatus st
       pure (if idle then "idle, ready for commands" else why)
     Dead -> pure "GHCi has EXITED"

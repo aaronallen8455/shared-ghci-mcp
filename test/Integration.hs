@@ -8,7 +8,7 @@
 module Main (main) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket)
+import Control.Exception (bracket, bracket_)
 import Control.Monad (filterM, unless, void, when)
 import Data.Aeson
 import Data.Aeson.Types (Pair, Parser, parseMaybe)
@@ -20,7 +20,7 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import System.Directory
 import System.Environment (lookupEnv)
-import System.Exit (exitSuccess)
+import System.Exit (ExitCode (..), exitSuccess)
 import System.FilePath ((</>))
 import System.IO
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory)
@@ -117,6 +117,16 @@ tests =
       failsWith env "ghci_eval" [] "invalid arguments"
       failsWith env "ghci_eval" ["command" .= (42 :: Int)] "expected String"
       failsWith env "no_such_tool" [] "unknown tool: no_such_tool"
+  , test "runs a wrapper script, typing the prompt setup into GHCi" $ \_ ->
+      withProject ["./repl.sh"] writeWrapper $ \dir -> do
+        st <- readState dir
+        lookup "init" st @?= Just "typed"
+        withServer dir $ \env -> do
+          assertContains "GHCi is ready" =<< ok env "ghci_wait" ["timeout_seconds" .= (120 :: Int)]
+          (@?= "42") =<< eval env "double 21"
+          -- the setup must be typed again after a restart
+          assertContains "GHCi is ready" =<< ok env "ghci_restart" ["timeout_seconds" .= (120 :: Int)]
+          (@?= "8") =<< eval env "double 4"
   , test "explains when there is no session" $ \_ -> do
       tmp <- getCanonicalTemporaryDirectory
       bracket (createTempDirectory tmp "no-session") removeDirectoryRecursive $ \dir ->
@@ -127,6 +137,15 @@ tests =
   ]
   where
     test name body = \getEnv -> testCase name (getEnv >>= body)
+
+-- | Stands in for a wrapper such as one that runs GHCi in docker: a command
+-- ghci-session can't pass -ghci-script to, with output before GHCi starts.
+writeWrapper :: FilePath -> IO ()
+writeWrapper dir = do
+  let f = dir </> "repl.sh"
+  writeFile f "#!/bin/sh\necho 'starting container...'\nsleep 1\nexec ghci Demo.hs\n"
+  p <- getPermissions f
+  setPermissions f (setOwnerExecutable True p)
 
 demoSource :: String
 demoSource =
@@ -179,6 +198,20 @@ teardown env = do
   script <- makeAbsolute ("bin" </> "ghci-session")
   void (readCreateProcessWithExitCode ((proc script ["stop"]) {cwd = Just (envDir env)}) "")
   removeDirectoryRecursive (envDir env)
+
+-- | A separate project and GHCi session, started with the given command after
+-- @prepare@ has run in the project directory.
+withProject :: [String] -> (FilePath -> IO ()) -> (FilePath -> IO a) -> IO a
+withProject cmd prepare body = do
+  script <- makeAbsolute ("bin" </> "ghci-session")
+  tmp <- getCanonicalTemporaryDirectory
+  bracket (createTempDirectory tmp "shared-ghci-wrapper") removeDirectoryRecursive $ \dir -> do
+    writeFile (dir </> "Demo.hs") demoSource
+    prepare dir
+    bracket_
+      (callProcessIn dir script ("start" : "--" : cmd))
+      (void (readCreateProcessWithExitCode ((proc script ["stop"]) {cwd = Just dir}) ""))
+      (body dir)
 
 withServer :: FilePath -> (Env -> IO a) -> IO a
 withServer dir = bracket (startServer dir) stopServer
@@ -234,10 +267,12 @@ findTmux = do
              ]
   filterM doesFileExist candidates
 
+-- | Run a command in a directory, failing the test (with its output) if it fails.
 callProcessIn :: FilePath -> FilePath -> [String] -> IO ()
 callProcessIn dir exe args = do
-  (_, _, _, ph) <- createProcess (proc exe args) {cwd = Just dir}
-  void (waitForProcess ph)
+  (ec, out, err) <- readCreateProcessWithExitCode (proc exe args) {cwd = Just dir} ""
+  when (ec /= ExitSuccess) $
+    assertFailure (unwords (exe : args) ++ " failed (" ++ show ec ++ "):\n" ++ out ++ err)
 
 readState :: FilePath -> IO [(String, String)]
 readState dir = do

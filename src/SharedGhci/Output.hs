@@ -4,6 +4,8 @@ module SharedGhci.Output
   ( -- * Prompts
     Prompt (..)
   , prompts
+  , promptSetup
+  , lastBanner
     -- * Cleaning terminal output
   , decodeLenient
   , clean
@@ -65,6 +67,27 @@ prompts = go 0
                   let e = i + BS.length marker + BS.length digits + BS.length close
                    in Prompt (read (BC.unpack digits)) i e : go e (BS.drop (e - off) bs)
                 else go (i + 1) (BS.drop (i + 1 - off) bs)
+
+-- | GHCi commands that install the numbered prompts 'prompts' looks for.
+-- The same text is in the init.ghci that @ghci-session@ writes.
+promptSetup :: [String]
+promptSetup =
+  [ ":set prompt-function \\_ n -> return (\"[ghci#\" ++ show n ++ \"]> \")"
+  , ":set prompt-cont-function \\_ n -> return (\"[ghci#\" ++ show n ++ \"]| \")"
+  ]
+
+-- | Byte index of the last @GHCi, version@ startup banner in the data. Once it
+-- has been printed, GHCi owns the terminal and typed input reaches it.
+lastBanner :: BS.ByteString -> Maybe Int
+lastBanner = go Nothing 0
+  where
+    banner = BC.pack "GHCi, version "
+    go found off bs =
+      let (pre, rest) = BS.breakSubstring banner bs
+          i = off + BS.length pre
+       in if BS.null rest
+            then found
+            else go (Just i) (i + 1) (BS.drop (BS.length pre + 1) bs)
 
 ------------------------------------------------------------------------------
 -- Cleaning terminal output

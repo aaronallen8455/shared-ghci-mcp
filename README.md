@@ -50,6 +50,7 @@ In a Haskell project root:
 ghci-session up                         # start (cabal repl) and attach
 ghci-session start -- cabal repl mylib  # pick a component; don't attach
 ghci-session start -- stack ghci
+ghci-session start -- ./repl.sh         # any wrapper script, e.g. GHCi in docker
 ghci-session attach                     # attach later (detach: C-b d)
 ghci-session log                        # page the full raw log
 ghci-session restart | stop | status
@@ -60,6 +61,33 @@ interfere with your normal tmux sessions. That server keeps 100,000 lines of
 scrollback. If GHCi exits, the pane stays open so you can read why.
 
 `.shared-ghci/` contains a `.gitignore` that ignores the whole directory.
+
+### Wrapper scripts and Docker
+
+The agent needs GHCi's prompt set to `[ghci#N]> `. There are two ways this
+happens:
+
+- **`cabal`, `stack`, `ghci` and `ghc` commands:** the launcher adds
+  `-ghci-script=.shared-ghci/init.ghci` to the command, so GHCi sets the
+  prompt at startup.
+- **Any other command** (a wrapper script, `docker run ...`, `nix develop -c
+  ...`): the launcher runs it unchanged. When the server sees GHCi's
+  `GHCi, version ...` banner in the log, it types the two `:set
+  prompt-function` commands into GHCi, and does so again after every restart.
+  You'll see those two lines appear in the session.
+
+For a script that runs GHCi in Docker:
+
+- Run the container with `-it`. tmux gives the script a real terminal, and
+  GHCi needs one inside the container too.
+- Don't start GHCi with `-v0`, which hides the banner the server waits for.
+- Compiler errors show paths as the container sees them (e.g.
+  `/app/src/Foo.hs`). If the project is mounted somewhere other than its host
+  path, tell the agent how to map them, for example in `CLAUDE.md`.
+
+To pass the startup script yourself instead, put `{ghci_script}` in the
+command where its path should go, e.g.
+`ghci-session start -- ./repl.sh --ghci-options=-ghci-script={ghci_script}`.
 
 ## Agent tools
 
@@ -87,8 +115,9 @@ You may want to add this to a project's `CLAUDE.md`:
   where output ends. `ghci_restart` restores it.
 - Escape sequences are removed from the output the agent sees, including any
   that your program prints on purpose.
-- Project paths containing spaces aren't supported, because `-ghci-script`
-  can't take a path with spaces.
+- Project paths containing spaces don't work with `cabal`, `stack` or `ghci`
+  commands, because `-ghci-script` can't take a path with spaces. Wrapper
+  scripts aren't affected.
 
 ## Tests
 
@@ -102,6 +131,7 @@ directory using `bin/ghci-session`. It then runs the server and acts as an MCP
 client, covering:
 
 - evaluation and multi-line input
+- starting through a wrapper script, with the prompt setup typed into GHCi
 - a 300+ line reload error, returned in full
 - timeouts, `ghci_wait` and interrupts
 - shortening long output

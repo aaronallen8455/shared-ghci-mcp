@@ -35,6 +35,12 @@ promptTests =
         map promptNumber (prompts (BC.pack "no newline[ghci#3]> ")) @?= [3]
     , testCase "finds a prompt after a false start" $
         map promptNumber (prompts (BC.pack "[ghci#[ghci#7]> ")) @?= [7]
+    , testCase "typing promptSetup doesn't itself look like a prompt" $
+        prompts (BC.pack (concat promptSetup)) @?= []
+    , testCase "lastBanner finds the most recent GHCi banner" $
+        lastBanner (BC.pack "GHCi, version 9.4\r\n...\r\nGHCi, version 9.4\r\n") @?= Just 24
+    , testCase "lastBanner is Nothing before GHCi starts" $
+        lastBanner (BC.pack "Resolving dependencies...\r\nBuilding library...") @?= Nothing
     ]
 
 stripAnsiTests :: TestTree
