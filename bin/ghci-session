@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# ghci-session: run a GHCi session in tmux that both you and an AI agent
+# (via the shared-ghci MCP server) can use.
+#
+# All terminal output is streamed to .shared-ghci/ghci.log with
+# `tmux pipe-pane`, so nothing is lost to scrollback limits.
+#
+# Usage (run from your project root):
+#   ghci-session start [-- CMD...]   start GHCi (default CMD: cabal repl)
+#   ghci-session up    [-- CMD...]   start if not running, then attach
+#   ghci-session attach              attach your terminal to the session
+#   ghci-session restart             restart GHCi with the same command
+#   ghci-session stop                kill the session (the log is kept)
+#   ghci-session status              show whether GHCi is running
+#   ghci-session log                 follow the full log in less
+#
+# CMD examples:
+#   ghci-session start -- cabal repl mylib
+#   ghci-session start -- stack ghci
+#   ghci-session start -- ghci src/Main.hs
+# For other commands, put {ghci_script} where the path to the GHCi startup
+# script should go, e.g.:  -- my-wrapper --ghc-arg=-ghci-script={ghci_script}
+
+set -euo pipefail
+
+SOCKET="${SHARED_GHCI_SOCKET:-shared-ghci}"
+STATE_DIRNAME=".shared-ghci"
+
+die() { echo "ghci-session: $*" >&2; exit 1; }
+
+find_tmux() {
+  local c
+  for c in "${SHARED_GHCI_TMUX:-}" "$(command -v tmux 2>/dev/null || true)" \
+           "$HOME/.nix-profile/bin/tmux" /run/current-system/sw/bin/tmux \
+           /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux; do
+    if [[ -n "$c" && -x "$c" ]]; then echo "$c"; return; fi
+  done
+  die "tmux not found (install it or set SHARED_GHCI_TMUX)"
+}
+TMUX_BIN="$(find_tmux)"
+t() { "$TMUX_BIN" -L "$SOCKET" "$@"; }
+
+# Find the project's state dir by walking up from $PWD (for every command
+# except start/up, which use $PWD as the project root).
+find_project() {
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    [[ -f "$d/$STATE_DIRNAME/state" ]] && { echo "$d"; return; }
+    d="$(dirname "$d")"
+  done
+  die "no $STATE_DIRNAME/state found here or in a parent directory; run 'ghci-session start' in your project root"
+}
+
+state_get() { # state_get FILE KEY
+  sed -n "s/^$2=//p" "$1" | head -n1
+}
+
+session_name_for() {
+  local base hash
+  base="$(basename "$1")"; base="${base//[^A-Za-z0-9_-]/_}"
+  hash="$(printf '%s' "$1" | cksum | awk '{print $1}' | cut -c1-6)"
+  echo "ghci-${base}-${hash}"
+}
+
+is_running() { t has-session -t "=$1" 2>/dev/null; }
+
+cmd_start() {
+  local dir="$PWD" state sess log init
+  state="$dir/$STATE_DIRNAME"
+  sess="$(session_name_for "$dir")"
+  if is_running "$sess"; then
+    echo "GHCi session '$sess' is already running (ghci-session attach / restart / stop)."
+    return 0
+  fi
+
+  mkdir -p "$state"
+  printf '*\n' > "$state/.gitignore"
+  log="$state/ghci.log"
+  init="$state/init.ghci"
+  [[ "$init" == *" "* ]] && die "project path contains spaces, which the -ghci-script flag can't handle: $init"
+
+  # The numbered prompt is how the MCP server tells where a command's output
+  # ends: it waits for a prompt with a higher number than before.
+  cat > "$init" <<'EOF'
+:set prompt-function \_ n -> return ("[ghci#" ++ show n ++ "]> ")
+:set prompt-cont-function \_ n -> return ("[ghci#" ++ show n ++ "]| ")
+EOF
+
+  local -a cmd
+  if (( $# > 0 )); then cmd=("$@"); else cmd=(cabal repl); fi
+  local injected=0 i
+  for i in "${!cmd[@]}"; do
+    if [[ "${cmd[$i]}" == *"{ghci_script}"* ]]; then
+      cmd[$i]="${cmd[$i]//\{ghci_script\}/$init}"; injected=1
+    fi
+  done
+  if (( ! injected )); then
+    case "$(basename "${cmd[0]}")" in
+      cabal) cmd+=("--repl-options=-ghci-script=$init") ;;
+      stack) cmd+=("--ghci-options=-ghci-script=$init") ;;
+      ghci|ghc|ghci-*|ghc-*) cmd+=("-ghci-script=$init") ;;
+      *) die "don't know how to pass -ghci-script to '${cmd[0]}'; put {ghci_script} in its arguments" ;;
+    esac
+  fi
+  local cmdstr
+  cmdstr="$(printf '%q ' "${cmd[@]}")"
+
+  {
+    echo "session=$sess"
+    echo "socket=$SOCKET"
+    echo "tmux=$TMUX_BIN"
+    echo "log=$log"
+    echo "dir=$dir"
+    echo "cmd=$cmdstr"
+  } > "$state/state"
+
+  : > "$log"
+  # Create the pane with a placeholder process, start logging, and only then
+  # launch GHCi, so no early output is missed.
+  t start-server \; set-option -g history-limit 100000 \; \
+    new-session -d -s "$sess" -x 250 -y 50 -c "$dir" "sleep 86400"
+  t set-option -w -t "=$sess:" remain-on-exit on
+  t pipe-pane -o -t "=$sess:" "cat >> $(printf '%q' "$log")"
+  t respawn-pane -k -t "=$sess:" -c "$dir" "$cmdstr"
+  echo "Started GHCi session '$sess': $cmdstr"
+  echo "  attach: ghci-session attach    log: $log"
+}
+
+cmd_attach() {
+  local dir sess
+  dir="$(find_project)"; sess="$(state_get "$dir/$STATE_DIRNAME/state" session)"
+  is_running "$sess" || die "session '$sess' is not running; use 'ghci-session start'"
+  TMUX='' t attach-session -t "=$sess"
+}
+
+cmd_restart() {
+  local dir state sess cmdstr log
+  dir="$(find_project)"; state="$dir/$STATE_DIRNAME/state"
+  sess="$(state_get "$state" session)"; cmdstr="$(state_get "$state" cmd)"
+  log="$(state_get "$state" log)"
+  is_running "$sess" || die "session '$sess' is not running; use 'ghci-session start'"
+  printf '\n===== shared-ghci: restarted %s =====\n' "$(date)" >> "$log"
+  t respawn-pane -k -t "=$sess:" -c "$dir" "$cmdstr"
+  echo "Restarted GHCi in '$sess'."
+}
+
+cmd_stop() {
+  local dir sess
+  dir="$(find_project)"; sess="$(state_get "$dir/$STATE_DIRNAME/state" session)"
+  if is_running "$sess"; then t kill-session -t "=$sess"; echo "Stopped '$sess'."
+  else echo "Session '$sess' was not running."; fi
+}
+
+cmd_status() {
+  local dir state sess
+  dir="$(find_project)"; state="$dir/$STATE_DIRNAME/state"
+  sess="$(state_get "$state" session)"
+  if is_running "$sess"; then
+    local dead
+    dead="$(t display-message -p -t "=$sess:" '#{pane_dead}')"
+    if [[ "$dead" == 1 ]]; then echo "session '$sess': GHCi has EXITED (ghci-session restart)"
+    else echo "session '$sess': running"; fi
+  else
+    echo "session '$sess': not running"
+  fi
+  echo "command: $(state_get "$state" cmd)"
+  echo "log:     $(state_get "$state" log)"
+}
+
+cmd_log() {
+  local dir
+  dir="$(find_project)"
+  exec less -R +F "$(state_get "$dir/$STATE_DIRNAME/state" log)"
+}
+
+sub="${1:-}"; shift || true
+if [[ "${1:-}" == "--" ]]; then shift; fi
+case "$sub" in
+  start)   cmd_start "$@" ;;
+  up)      cmd_start "$@" >/dev/null; cmd_attach ;;
+  attach)  cmd_attach ;;
+  restart) cmd_restart ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  log)     cmd_log ;;
+  *) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; [[ -z "$sub" || "$sub" == -h || "$sub" == --help ]] || exit 1 ;;
+esac
