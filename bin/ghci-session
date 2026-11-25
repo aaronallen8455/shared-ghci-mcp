@@ -105,7 +105,10 @@ cmd_start() {
   if ! t show-options -s terminal-overrides 2>/dev/null | grep -q 'smcup@'; then
     t set-option -as terminal-overrides ',*:smcup@:rmcup@'
   fi
+  # Keep the pane when GHCi exits (so the agent can see why and restart it),
+  # but detach anyone attached, rather than leaving them on a dead pane.
   t set-option -w -t "=$sess:" remain-on-exit on
+  t set-hook -t "=$sess:" pane-died "detach-client -s '=$sess'"
   t pipe-pane -o -t "=$sess:" "cat >> $(printf '%q' "$log")"
   t respawn-pane -k -t "=$sess:" -c "$dir" "$cmdstr"
   echo "Started GHCi session '$sess': $cmdstr"

@@ -60,7 +60,10 @@ ghci-session restart | stop | status
 
 The session uses its own tmux server (`tmux -L shared-ghci`), so it doesn't
 interfere with your normal tmux sessions. That server keeps 100,000 lines of
-scrollback. If GHCi exits, the pane stays open so you can read why.
+scrollback. If GHCi exits (`:q`, a crash, a failed build), anyone attached
+is detached automatically. The session stays in place, so the agent can still
+see why GHCi exited and restart it, and `ghci-session attach` shows the last
+output. `ghci-session restart` starts GHCi again.
 
 `.shared-ghci/` contains a `.gitignore` that ignores the whole directory.
 
